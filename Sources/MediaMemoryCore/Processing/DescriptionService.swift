@@ -1,0 +1,210 @@
+import CryptoKit
+import Foundation
+
+public enum DescriptionServiceError: Error, LocalizedError, Sendable {
+    case missingSegment
+    case missingFrames
+    case frameOutsideWorkDirectory
+
+    public var errorDescription: String? {
+        switch self {
+        case .missingSegment:
+            "片段已经不存在。"
+        case .missingFrames:
+            "片段代表帧缺失，请重试该建库任务。"
+        case .frameOutsideWorkDirectory:
+            "数据库中的代表帧路径越过了应用工作目录。"
+        }
+    }
+}
+
+public actor DescriptionService {
+    public static let promptVersion = "observable-segment-description-v2"
+
+    private let database: MediaDatabase
+    private let configuration: ModelConfiguration
+    private let runtime: LocalModelRuntime
+    private let workRoot: URL
+
+    public init(
+        database: MediaDatabase,
+        configuration: ModelConfiguration,
+        runtime: LocalModelRuntime,
+        workRoot: URL
+    ) {
+        self.database = database
+        self.configuration = configuration
+        self.runtime = runtime
+        self.workRoot = workRoot.standardizedFileURL
+    }
+
+    public var descriptionModelID: String { configuration.omlx.descriptionModelID }
+
+    /// 展示用：最新缓存描述，不校验版本；调用方负责提示旧版。
+    public func latestDescription(segmentID: String) async throws -> CachedSegmentDescription? {
+        try await database.latestDescription(segmentID: segmentID)
+    }
+
+    public func latestDescriptions(assetID: String) async throws -> [String: CachedSegmentDescription] {
+        try await database.latestDescriptions(assetID: assetID)
+    }
+
+    public func cachedDescription(segmentID: String) async throws -> CachedSegmentDescription? {
+        guard let prepared = try? await prepareInput(segmentID: segmentID) else { return nil }
+        return try await database.cachedDescription(
+            segmentID: segmentID,
+            inputVersion: prepared.inputVersion
+        )
+    }
+
+    public func description(segmentID: String) async throws -> CachedSegmentDescription {
+        let prepared = try await prepareInput(segmentID: segmentID)
+        if let cached = try await database.cachedDescription(
+            segmentID: segmentID,
+            inputVersion: prepared.inputVersion
+        ) {
+            return cached
+        }
+        let value = try await generate(prepared)
+        try await database.saveDescription(
+            segmentID: segmentID,
+            sourceFingerprint: prepared.context.asset.fingerprint,
+            expectedInputRevision: prepared.revision,
+            modelID: configuration.omlx.descriptionModelID,
+            runtimeVersion: SegmentIndexer.runtimeVersion,
+            promptVersion: Self.promptVersion,
+            inputVersion: prepared.inputVersion,
+            description: value
+        )
+        guard let saved = try await database.cachedDescription(
+            segmentID: segmentID,
+            inputVersion: prepared.inputVersion
+        ) else {
+            throw DescriptionServiceError.missingSegment
+        }
+        return saved
+    }
+
+    /// 后台描述车道入口：描述写入与 job 完成在数据库中原子提交。
+    public func description(for target: SegmentIndexTarget) async throws -> CachedSegmentDescription {
+        guard let expectedRevision = target.descriptionInputRevision else {
+            throw MediaDatabaseDerivationError.descriptionInputChanged
+        }
+        let prepared = try await prepareInput(
+            segmentID: target.segment.id,
+            expectedRevision: expectedRevision
+        )
+        if let cached = try await database.cachedDescription(
+            segmentID: target.segment.id,
+            inputVersion: prepared.inputVersion
+        ) {
+            try await database.completeDescribeJob(
+                claim: target.job.claimToken,
+                expectedInputRevision: prepared.revision
+            )
+            return cached
+        }
+        let value = try await generate(prepared)
+        try await database.commitDescription(
+            claim: target.job.claimToken,
+            segmentID: target.segment.id,
+            sourceFingerprint: prepared.context.asset.fingerprint,
+            expectedInputRevision: prepared.revision,
+            modelID: configuration.omlx.descriptionModelID,
+            runtimeVersion: SegmentIndexer.runtimeVersion,
+            promptVersion: Self.promptVersion,
+            inputVersion: prepared.inputVersion,
+            description: value
+        )
+        guard let saved = try await database.cachedDescription(
+            segmentID: target.segment.id,
+            inputVersion: prepared.inputVersion
+        ) else {
+            throw DescriptionServiceError.missingSegment
+        }
+        return saved
+    }
+
+    private struct PreparedDescriptionInput: Sendable {
+        let context: SegmentSearchContext
+        let frames: [SegmentFrameRecord]
+        let revision: String
+        let inputVersion: String
+    }
+
+    /// Evidence and frames are committed atomically by the evidence lane. Reading
+    /// the unique embedding revision before and after gives this multi-query read
+    /// a stable snapshot without coupling either lane's lifecycle.
+    private func prepareInput(
+        segmentID: String,
+        expectedRevision: String? = nil
+    ) async throws -> PreparedDescriptionInput {
+        guard let before = try await database.descriptionInputRevision(segmentID: segmentID) else {
+            throw DescriptionServiceError.missingSegment
+        }
+        if let expectedRevision, before != expectedRevision {
+            throw MediaDatabaseDerivationError.descriptionInputChanged
+        }
+        guard let context = try await database.searchContext(segmentID: segmentID) else {
+            throw DescriptionServiceError.missingSegment
+        }
+        let frames = try await database.segmentFrames(segmentID: segmentID)
+        guard !frames.isEmpty else { throw DescriptionServiceError.missingFrames }
+        guard let after = try await database.descriptionInputRevision(segmentID: segmentID),
+              before == after else {
+            throw MediaDatabaseDerivationError.descriptionInputChanged
+        }
+        return PreparedDescriptionInput(
+            context: context,
+            frames: frames,
+            revision: before,
+            inputVersion: Self.inputVersion(
+                context: context,
+                frames: frames,
+                modelID: configuration.omlx.descriptionModelID
+            )
+        )
+    }
+
+    private func generate(_ input: PreparedDescriptionInput) async throws -> SegmentDescription {
+        let timedImages = try input.frames.map { frame in
+            let url = workRoot.appending(path: frame.relativePath).standardizedFileURL
+            guard url.path.hasPrefix(workRoot.path + "/") else {
+                throw DescriptionServiceError.frameOutsideWorkDirectory
+            }
+            guard FileManager.default.fileExists(atPath: url.path) else {
+                throw DescriptionServiceError.missingFrames
+            }
+            return TimedImageInput(timeMS: frame.timeMS, url: url)
+        }
+        let evidenceText = input.context.evidence.map { evidence in
+            let label = evidence.kind == .transcript ? "ASR" : "OCR"
+            return "[\(label) \(format(evidence.startMS))–\(format(evidence.endMS))] \(evidence.text)"
+        }.joined(separator: "\n")
+        return try await runtime.describe(
+            images: timedImages,
+            evidenceText: evidenceText.isEmpty ? "没有识别到 ASR 或 OCR 文本。" : evidenceText
+        )
+    }
+
+    private static func inputVersion(
+        context: SegmentSearchContext,
+        frames: [SegmentFrameRecord],
+        modelID: String
+    ) -> String {
+        let source = [
+            promptVersion,
+            modelID,
+            context.asset.fingerprint,
+            frames.map { "\($0.timeMS):\($0.relativePath):\($0.perceptualHash)" }.joined(separator: "|"),
+            context.evidence.map { "\($0.id):\($0.text)" }.joined(separator: "|")
+        ].joined(separator: "\n")
+        return SHA256.hash(data: Data(source.utf8))
+            .map { String(format: "%02x", $0) }
+            .joined()
+    }
+
+    private func format(_ milliseconds: Int64) -> String {
+        String(format: "%.3fs", Double(milliseconds) / 1_000)
+    }
+}

@@ -1,0 +1,44 @@
+.DS_Store
+.build/
+.swiftpm/
+.env*
+!.env.example
+.media-memory/
+/test media/
+DerivedData/
+xcuserdata/
+*.xcuserstate
+.idea/
+.vscode/
+work/
+
+# Local databases and derived state
+*.sqlite
+*.sqlite-*
+*.db
+*.db-*
+
+# Personal media is opt-in (`git add -f`) rather than publish-by-accident
+*.mp4
+*.mov
+*.m4v
+*.mkv
+*.avi
+*.wav
+*.m4a
+
+# Signing and service credentials
+*.pem
+*.key
+*.p12
+*.p8
+*.cer
+*.crt
+*.der
+*.mobileprovision
+*.xcarchive
+*.dmg
+.netrc
+.npmrc
+id_rsa
+id_ed25519
