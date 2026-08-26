@@ -70,6 +70,23 @@ public actor SegmentIndexer {
             .joined()
     }
 
+    /// Schema-1 persisted the three bare model IDs in the evidence fingerprint.
+    /// This is used only by the one-time database migration; normal runtime
+    /// identity checks always use `inputVersion(for:)` above.
+    public static func legacyInputVersion(for configuration: ModelConfiguration) -> String {
+        let source = [
+            "segment-v1",
+            frameSelectionVersion,
+            "vision-ocr-v1",
+            configuration.asr.modelID,
+            configuration.aligner.modelID,
+            configuration.embedding.modelID
+        ].joined(separator: "|")
+        return SHA256.hash(data: Data(source.utf8))
+            .map { String(format: "%02x", $0) }
+            .joined()
+    }
+
     public func prepareQueue() async throws -> IndexingProgress {
         let activated = try await database.activateAllReadySegmentations()
         if activated { await cleanupPrunedFrames() }

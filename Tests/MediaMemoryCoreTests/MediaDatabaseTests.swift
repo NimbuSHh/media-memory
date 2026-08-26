@@ -112,6 +112,341 @@ final class MediaDatabaseTests: XCTestCase {
         XCTAssertEqual(matches.first?.evidence.kind, .visual)
     }
 
+    func testLegacyModelIdentityMigrationRelabelsCompletedDataWithoutModelWork() async throws {
+        let temporary = try TemporaryDirectory()
+        let databaseURL = temporary.url.appending(path: "identity.sqlite")
+        let database = try MediaDatabase(url: databaseURL)
+        let configuration = migrationConfiguration(root: temporary.url)
+        let legacyIndexVersion = SegmentIndexer.legacyInputVersion(for: configuration)
+        let currentIndexVersion = SegmentIndexer.inputVersion(for: configuration)
+        let root = try await database.addLibraryRoot(
+            path: temporary.url.path,
+            bookmark: Data([8])
+        )
+        try await database.applyScan(
+            rootID: root.id,
+            result: MediaScanResult(
+                assets: [sampleAsset(relativePath: "legacy.mp4", durationMS: 10_000)],
+                unstableFileCount: 0,
+                skippedFileCount: 0,
+                errors: []
+            )
+        )
+        try await database.reconcileIndexJobs(
+            embeddingModelID: configuration.embedding.modelID,
+            inputVersion: legacyIndexVersion
+        )
+        let evidence = try unwrapTarget(try await database.claimNextIndexJob())
+        try await database.commitIndexOutput(
+            claim: evidence.job.claimToken,
+            segmentID: evidence.segment.id,
+            output: testIndexOutput(
+                fingerprint: evidence.asset.fingerprint,
+                framePath: "Frames/legacy/00.jpg"
+            ),
+            inputVersion: legacyIndexVersion
+        )
+
+        try await database.reconcileDescribeJobs()
+        let description = try unwrapTarget(try await database.claimNextDescribeJob())
+        let legacyContextValue = try await database.searchContext(segmentID: evidence.segment.id)
+        let legacyContext = try XCTUnwrap(legacyContextValue)
+        let legacyFrames = try await database.segmentFrames(segmentID: evidence.segment.id)
+        let legacyDescriptionVersion = DescriptionService.inputVersion(
+            context: legacyContext,
+            frames: legacyFrames,
+            modelID: configuration.description.modelID
+        )
+        try await commitTestDescription(
+            database: database,
+            target: description,
+            inputVersion: legacyDescriptionVersion,
+            summary: "保留的旧描述",
+            modelID: configuration.description.modelID,
+            promptVersion: DescriptionService.promptVersion
+        )
+
+        // Reproduce the transitional build: it sees the new identity and turns
+        // an otherwise complete evidence job back into work.
+        try await database.reconcileIndexJobs(
+            embeddingModelID: configuration.embedding.derivationID,
+            inputVersion: currentIndexVersion
+        )
+        _ = try unwrapTarget(try await database.claimNextIndexJob())
+        var progress = try await database.indexingProgress()
+        XCTAssertEqual(progress.running, 1)
+
+        let didMigrate = try await database.migrateLegacyModelIdentities(
+            configuration: configuration,
+            allowLegacyAdoption: true
+        )
+        let didMigrateAgain = try await database.migrateLegacyModelIdentities(
+            configuration: configuration,
+            allowLegacyAdoption: true
+        )
+        XCTAssertTrue(didMigrate)
+        XCTAssertFalse(didMigrateAgain)
+
+        progress = try await database.indexingProgress()
+        XCTAssertEqual(progress.succeeded, 1)
+        XCTAssertEqual(progress.pending, 0)
+        XCTAssertEqual(progress.running, 0)
+        let embeddings = try await database.storedEmbeddings(
+            modelID: configuration.embedding.derivationID,
+            inputVersion: currentIndexVersion
+        )
+        XCTAssertEqual(
+            embeddings,
+            [StoredEmbedding(segmentID: evidence.segment.id, values: [0.6, 0.8])]
+        )
+
+        let currentContextValue = try await database.searchContext(segmentID: evidence.segment.id)
+        let currentContext = try XCTUnwrap(currentContextValue)
+        let currentFrames = try await database.segmentFrames(segmentID: evidence.segment.id)
+        let currentDescriptionVersion = DescriptionService.inputVersion(
+            context: currentContext,
+            frames: currentFrames,
+            modelID: configuration.description.derivationID
+        )
+        let cached = try await database.cachedDescription(
+            segmentID: evidence.segment.id,
+            inputVersion: currentDescriptionVersion
+        )
+        XCTAssertEqual(cached?.description.summary, "保留的旧描述")
+        XCTAssertEqual(cached?.modelID, configuration.description.derivationID)
+
+        try await database.reconcileIndexJobs(
+            embeddingModelID: configuration.embedding.derivationID,
+            inputVersion: currentIndexVersion
+        )
+        try await database.reconcileDescribeJobs()
+        let finalIndexProgress = try await database.indexingProgress()
+        let finalDescriptionProgress = try await database.describeProgress()
+        XCTAssertEqual(finalIndexProgress.pending, 0)
+        XCTAssertEqual(finalDescriptionProgress.pending, 0)
+
+        // The fixture is silent, so neither run is referenced by a transcript.
+        // Their commit cohort must still migrate as complete provenance.
+        let inspection = try SQLiteConnection(url: databaseURL, readOnly: true)
+        let legacyRuns = try inspection.prepare(
+            """
+            SELECT count(*) FROM derivation_run
+            WHERE (kind = 'asr' AND model_id = ?)
+               OR (kind = 'alignment' AND model_id = ?)
+            """
+        )
+        try legacyRuns.bind(.text(configuration.asr.modelID), at: 1)
+        try legacyRuns.bind(.text(configuration.aligner.modelID), at: 2)
+        XCTAssertTrue(try legacyRuns.step())
+        XCTAssertEqual(legacyRuns.integer(at: 0), 0)
+    }
+
+    func testLegacyModelIdentityMigrationDoesNotAdoptDifferentPipeline() async throws {
+        let temporary = try TemporaryDirectory()
+        let database = try MediaDatabase(url: temporary.url.appending(path: "identity.sqlite"))
+        let original = migrationConfiguration(root: temporary.url)
+        let changed = migrationConfiguration(root: temporary.url, asrModelID: "new-asr-model")
+        let legacyIndexVersion = SegmentIndexer.legacyInputVersion(for: original)
+        let root = try await database.addLibraryRoot(
+            path: temporary.url.path,
+            bookmark: Data([9])
+        )
+        try await database.applyScan(
+            rootID: root.id,
+            result: MediaScanResult(
+                assets: [sampleAsset(relativePath: "changed.mp4", durationMS: 10_000)],
+                unstableFileCount: 0,
+                skippedFileCount: 0,
+                errors: []
+            )
+        )
+        try await database.reconcileIndexJobs(
+            embeddingModelID: original.embedding.modelID,
+            inputVersion: legacyIndexVersion
+        )
+        let evidence = try unwrapTarget(try await database.claimNextIndexJob())
+        try await database.commitIndexOutput(
+            claim: evidence.job.claimToken,
+            segmentID: evidence.segment.id,
+            output: testIndexOutput(
+                fingerprint: evidence.asset.fingerprint,
+                framePath: "Frames/changed/00.jpg"
+            ),
+            inputVersion: legacyIndexVersion
+        )
+
+        let didMigrate = try await database.migrateLegacyModelIdentities(
+            configuration: changed,
+            allowLegacyAdoption: true
+        )
+        XCTAssertTrue(didMigrate)
+        try await database.reconcileIndexJobs(
+            embeddingModelID: changed.embedding.derivationID,
+            inputVersion: SegmentIndexer.inputVersion(for: changed)
+        )
+        let progress = try await database.indexingProgress()
+        XCTAssertEqual(progress.pending, 1)
+        let incompatible = try await database.storedEmbeddings(
+            modelID: changed.embedding.derivationID,
+            inputVersion: SegmentIndexer.inputVersion(for: changed)
+        )
+        XCTAssertTrue(incompatible.isEmpty)
+        let retainedLegacy = try await database.storedEmbeddings(
+            modelID: original.embedding.modelID,
+            inputVersion: legacyIndexVersion
+        )
+        XCTAssertEqual(retainedLegacy.count, 1)
+    }
+
+    func testLegacyModelIdentityMigrationDoesNotGuessSameNameSchemaTwoEndpoint() async throws {
+        let temporary = try TemporaryDirectory()
+        let database = try MediaDatabase(url: temporary.url.appending(path: "identity.sqlite"))
+        let original = migrationConfiguration(root: temporary.url)
+        let unproven = endpointMigrationConfiguration()
+        let legacyIndexVersion = SegmentIndexer.legacyInputVersion(for: original)
+        let root = try await database.addLibraryRoot(
+            path: temporary.url.path,
+            bookmark: Data([10])
+        )
+        try await database.applyScan(
+            rootID: root.id,
+            result: MediaScanResult(
+                assets: [sampleAsset(relativePath: "same-name.mp4", durationMS: 10_000)],
+                unstableFileCount: 0,
+                skippedFileCount: 0,
+                errors: []
+            )
+        )
+        try await database.reconcileIndexJobs(
+            embeddingModelID: original.embedding.modelID,
+            inputVersion: legacyIndexVersion
+        )
+        let evidence = try unwrapTarget(try await database.claimNextIndexJob())
+        try await database.commitIndexOutput(
+            claim: evidence.job.claimToken,
+            segmentID: evidence.segment.id,
+            output: testIndexOutput(
+                fingerprint: evidence.asset.fingerprint,
+                framePath: "Frames/same-name/00.jpg"
+            ),
+            inputVersion: legacyIndexVersion
+        )
+
+        let didMigrate = try await database.migrateLegacyModelIdentities(
+            configuration: unproven,
+            allowLegacyAdoption: false
+        )
+        XCTAssertTrue(didMigrate)
+        try await database.reconcileIndexJobs(
+            embeddingModelID: unproven.embedding.derivationID,
+            inputVersion: SegmentIndexer.inputVersion(for: unproven)
+        )
+        let progress = try await database.indexingProgress()
+        XCTAssertEqual(progress.pending, 1)
+        let incorrectlyAdopted = try await database.storedEmbeddings(
+            modelID: unproven.embedding.derivationID,
+            inputVersion: SegmentIndexer.inputVersion(for: unproven)
+        )
+        XCTAssertTrue(incorrectlyAdopted.isEmpty)
+    }
+
+    func testLegacyDescriptionIsNotRelabelledAfterEvidenceActuallyChanged() async throws {
+        let temporary = try TemporaryDirectory()
+        let database = try MediaDatabase(url: temporary.url.appending(path: "identity.sqlite"))
+        let configuration = migrationConfiguration(root: temporary.url)
+        let legacyIndexVersion = SegmentIndexer.legacyInputVersion(for: configuration)
+        let currentIndexVersion = SegmentIndexer.inputVersion(for: configuration)
+        let root = try await database.addLibraryRoot(
+            path: temporary.url.path,
+            bookmark: Data([11])
+        )
+        try await database.applyScan(
+            rootID: root.id,
+            result: MediaScanResult(
+                assets: [sampleAsset(relativePath: "partial.mp4", durationMS: 10_000)],
+                unstableFileCount: 0,
+                skippedFileCount: 0,
+                errors: []
+            )
+        )
+        try await database.reconcileIndexJobs(
+            embeddingModelID: configuration.embedding.modelID,
+            inputVersion: legacyIndexVersion
+        )
+        let legacyEvidence = try unwrapTarget(try await database.claimNextIndexJob())
+        try await database.commitIndexOutput(
+            claim: legacyEvidence.job.claimToken,
+            segmentID: legacyEvidence.segment.id,
+            output: testIndexOutput(
+                fingerprint: legacyEvidence.asset.fingerprint,
+                framePath: "Frames/partial/old.jpg",
+                frameHash: 1
+            ),
+            inputVersion: legacyIndexVersion
+        )
+        try await database.reconcileDescribeJobs()
+        let legacyDescription = try unwrapTarget(try await database.claimNextDescribeJob())
+        let oldContextValue = try await database.searchContext(segmentID: legacyEvidence.segment.id)
+        let oldContext = try XCTUnwrap(oldContextValue)
+        let oldFrames = try await database.segmentFrames(segmentID: legacyEvidence.segment.id)
+        let oldDescriptionVersion = DescriptionService.inputVersion(
+            context: oldContext,
+            frames: oldFrames,
+            modelID: configuration.description.modelID
+        )
+        try await commitTestDescription(
+            database: database,
+            target: legacyDescription,
+            inputVersion: oldDescriptionVersion,
+            summary: "只看过旧证据",
+            modelID: configuration.description.modelID,
+            promptVersion: DescriptionService.promptVersion
+        )
+
+        // The transitional build commits a genuinely different frame before
+        // the fixed build can migrate the remaining legacy rows.
+        try await database.requeueSegmentIndexJob(segmentID: legacyEvidence.segment.id)
+        let refreshedEvidence = try unwrapTarget(try await database.claimNextIndexJob())
+        try await database.commitIndexOutput(
+            claim: refreshedEvidence.job.claimToken,
+            segmentID: refreshedEvidence.segment.id,
+            output: testIndexOutput(
+                fingerprint: refreshedEvidence.asset.fingerprint,
+                framePath: "Frames/partial/new.jpg",
+                frameHash: 2,
+                asrModelID: configuration.asr.derivationID,
+                alignerModelID: configuration.aligner.derivationID,
+                embeddingModelID: configuration.embedding.derivationID
+            ),
+            inputVersion: currentIndexVersion
+        )
+
+        _ = try await database.migrateLegacyModelIdentities(
+            configuration: configuration,
+            allowLegacyAdoption: true
+        )
+        try await database.reconcileDescribeJobs()
+
+        let latest = try await database.latestDescription(segmentID: legacyEvidence.segment.id)
+        XCTAssertEqual(latest?.description.summary, "只看过旧证据")
+        XCTAssertEqual(latest?.modelID, configuration.description.modelID)
+        let descriptionProgress = try await database.describeProgress()
+        XCTAssertEqual(descriptionProgress.pending, 1)
+        let newContextValue = try await database.searchContext(segmentID: legacyEvidence.segment.id)
+        let newContext = try XCTUnwrap(newContextValue)
+        let newFrames = try await database.segmentFrames(segmentID: legacyEvidence.segment.id)
+        let currentDescriptionVersion = DescriptionService.inputVersion(
+            context: newContext,
+            frames: newFrames,
+            modelID: configuration.description.derivationID
+        )
+        let incorrectlyAdopted = try await database.cachedDescription(
+            segmentID: legacyEvidence.segment.id,
+            inputVersion: currentDescriptionVersion
+        )
+        XCTAssertNil(incorrectlyAdopted)
+    }
+
     func testScanCreatesStableAssetAndLegacyFallbackSegments() async throws {
         let temporary = try TemporaryDirectory()
         let database = try MediaDatabase(url: temporary.url.appending(path: "test.sqlite"))
@@ -1547,20 +1882,70 @@ final class MediaDatabaseTests: XCTestCase {
 
     private func testIndexOutput(
         fingerprint: String,
-        framePath: String
+        framePath: String,
+        frameHash: UInt64 = 1,
+        asrModelID: String = "asr-model",
+        alignerModelID: String = "aligner-model",
+        embeddingModelID: String = "embedding-model"
     ) -> SegmentIndexOutput {
         SegmentIndexOutput(
             sourceFingerprint: fingerprint,
             transcripts: [],
             ocr: [],
             frames: [
-                SegmentFrameDraft(timeMS: 0, relativePath: framePath, perceptualHash: 1)
+                SegmentFrameDraft(timeMS: 0, relativePath: framePath, perceptualHash: frameHash)
             ],
             embedding: EmbeddingVector(values: [0.6, 0.8], norm: 1),
-            asrModelID: "asr-model",
-            alignerModelID: "aligner-model",
-            embeddingModelID: "embedding-model",
+            asrModelID: asrModelID,
+            alignerModelID: alignerModelID,
+            embeddingModelID: embeddingModelID,
             runtimeVersion: "test"
+        )
+    }
+
+    private func migrationConfiguration(
+        root: URL,
+        asrModelID: String = "asr-model"
+    ) -> ModelConfiguration {
+        ModelConfiguration(
+            schemaVersion: 1,
+            omlx: .init(
+                baseURL: URL(string: "http://127.0.0.1:8000/v1")!,
+                asrModelID: asrModelID,
+                descriptionModelID: "description-model"
+            ),
+            worker: .init(
+                forcedAlignerModelID: "aligner-model",
+                embeddingModelID: "embedding-model",
+                pythonLauncherPath: "/usr/bin/python3",
+                modelRootPath: root.appending(path: "Models").path
+            )
+        )
+    }
+
+    private func endpointMigrationConfiguration() -> ModelConfiguration {
+        ModelConfiguration(
+            asr: ModelEndpoint(
+                transport: .openAITranscription,
+                endpointURL: URL(string: "https://replacement.example/v1/audio/transcriptions"),
+                modelID: "asr-model"
+            ),
+            aligner: ModelEndpoint(
+                transport: .mediaMemoryAlignment,
+                endpointURL: URL(string: "https://replacement.example/alignment"),
+                modelID: "aligner-model"
+            ),
+            embedding: ModelEndpoint(
+                transport: .mediaMemoryEmbedding,
+                endpointURL: URL(string: "https://replacement.example/embedding"),
+                modelID: "embedding-model"
+            ),
+            description: ModelEndpoint(
+                transport: .openAIChatCompletion,
+                endpointURL: URL(string: "https://replacement.example/v1/chat/completions"),
+                modelID: "description-model"
+            ),
+            localWorker: nil
         )
     }
 

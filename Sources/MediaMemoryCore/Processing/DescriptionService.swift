@@ -194,7 +194,7 @@ public actor DescriptionService {
         }
     }
 
-    private static func inputVersion(
+    static func inputVersion(
         context: SegmentSearchContext,
         frames: [SegmentFrameRecord],
         modelID: String

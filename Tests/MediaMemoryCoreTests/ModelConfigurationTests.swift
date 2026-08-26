@@ -53,8 +53,10 @@ final class ModelConfigurationTests: XCTestCase {
         try data.write(to: url, options: .atomic)
         defer { try? FileManager.default.removeItem(at: url) }
 
-        let configuration = try ModelConfiguration.load(from: url)
+        let loaded = try ModelConfigurationStore.loadForStartup(from: url)
+        let configuration = loaded.configuration
 
+        XCTAssertTrue(loaded.canAdoptLegacyModelIdentities)
         XCTAssertEqual(configuration.schemaVersion, 2)
         XCTAssertEqual(configuration.asr.modelID, "replacement-asr")
         XCTAssertEqual(
@@ -63,6 +65,42 @@ final class ModelConfigurationTests: XCTestCase {
         )
         XCTAssertEqual(configuration.embedding.modelID, "replacement-embedding")
         XCTAssertEqual(configuration.embedding.transport, .localWorker)
+    }
+
+    func testSavedSchemaTwoConfigurationCannotSilentlyAdoptBareLegacyIdentities() throws {
+        let source = ModelConfiguration(
+            asr: ModelEndpoint(
+                transport: .openAITranscription,
+                endpointURL: URL(string: "https://replacement.example/v1/audio/transcriptions"),
+                modelID: "same-asr-name"
+            ),
+            aligner: ModelEndpoint(
+                transport: .mediaMemoryAlignment,
+                endpointURL: URL(string: "https://replacement.example/alignment"),
+                modelID: "same-aligner-name"
+            ),
+            embedding: ModelEndpoint(
+                transport: .mediaMemoryEmbedding,
+                endpointURL: URL(string: "https://replacement.example/embedding"),
+                modelID: "same-embedding-name"
+            ),
+            description: ModelEndpoint(
+                transport: .openAIChatCompletion,
+                endpointURL: URL(string: "https://replacement.example/v1/chat/completions"),
+                modelID: "same-description-name"
+            ),
+            localWorker: nil
+        )
+        let url = FileManager.default.temporaryDirectory
+            .appending(path: "media-memory-models-\(UUID().uuidString).json")
+        try JSONEncoder().encode(source).write(to: url, options: .atomic)
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let loaded = try ModelConfigurationStore.loadForStartup(from: url)
+
+        XCTAssertFalse(loaded.canAdoptLegacyModelIdentities)
+        XCTAssertEqual(loaded.configuration.asr.modelID, source.asr.modelID)
+        XCTAssertEqual(loaded.configuration.asr.endpointURL, source.asr.endpointURL)
     }
 
     func testDerivationIdentityChangesWithEndpointButNotCredentials() throws {

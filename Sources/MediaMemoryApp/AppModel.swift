@@ -978,10 +978,18 @@ final class AppModel: ObservableObject {
     /// nonisolated async：在全局执行器上打开数据库与读取配置，
     /// 首次迁移或 WAL 恢复再慢也不占用主线程。
     private nonisolated static func loadLocalCore() async throws -> BootstrapCore {
-        let configuration = try ModelConfigurationStore.load()
         let instanceLock = try ApplicationInstanceLock(url: ApplicationPaths.instanceLockURL())
+        let loadedConfiguration = try ModelConfigurationStore.loadForStartup()
+        let configuration = loadedConfiguration.configuration
         let databaseURL = try ApplicationPaths.databaseURL()
         let database = try MediaDatabase(url: databaseURL)
+        // Schema-1 model outputs are byte-compatible with schema 2. Relabel
+        // exact pipeline matches before any read snapshot or worker can observe
+        // them, so upgrading never turns completed videos back into model work.
+        try await database.migrateLegacyModelIdentities(
+            configuration: configuration,
+            allowLegacyAdoption: loadedConfiguration.canAdoptLegacyModelIdentities
+        )
         // Open only after the writer has completed migrations. Both connections
         // use WAL snapshots, but their actor queues remain independent.
         let readDatabase = try MediaDatabase(readOnlyURL: databaseURL)

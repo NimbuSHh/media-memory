@@ -6,7 +6,7 @@ public enum MediaDatabaseOpenError: Error, LocalizedError, Equatable, Sendable {
     public var errorDescription: String? {
         switch self {
         case let .unsupportedSchemaVersion(version):
-            "数据库版本 \(version) 高于当前应用支持的版本 7，请使用更新版本的 Media Memory。"
+            "数据库版本 \(version) 高于当前应用支持的版本 8，请使用更新版本的 Media Memory。"
         }
     }
 }
@@ -742,7 +742,7 @@ public actor MediaDatabase {
 
     private static func migrate(_ connection: SQLiteConnection) throws {
         let version = try schemaVersion(connection)
-        guard version <= 7 else {
+        guard version <= 8 else {
             throw MediaDatabaseOpenError.unsupportedSchemaVersion(version)
         }
         try connection.execute("PRAGMA foreign_keys = ON")
@@ -897,6 +897,11 @@ public actor MediaDatabase {
             CREATE UNIQUE INDEX IF NOT EXISTS job_asset_kind
                 ON job(asset_id, kind) WHERE segment_id IS NULL AND asset_id IS NOT NULL;
 
+            CREATE TABLE IF NOT EXISTS application_metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+
             CREATE VIRTUAL TABLE IF NOT EXISTS evidence_fts USING fts5(
                 segment_id UNINDEXED,
                 evidence_type UNINDEXED,
@@ -925,7 +930,7 @@ public actor MediaDatabase {
 
             """
         )
-        if version < 7 {
+        if version < 8 {
             // DDL 与版本号必须一起提交。列存在检查也让曾在旧实现中断于
             // ALTER TABLE 与 user_version 之间的数据库可以安全恢复。
             try connection.inTransaction {
@@ -979,6 +984,12 @@ public actor MediaDatabase {
                         "CREATE UNIQUE INDEX IF NOT EXISTS job_asset_kind ON job(asset_id, kind) WHERE segment_id IS NULL AND asset_id IS NOT NULL"
                     )
                     try connection.execute("PRAGMA user_version = 7")
+                }
+                if version < 8 {
+                    // 模型身份从裸 model ID 升级为 transport/endpoint/model
+                    // 组合身份。实际数据迁移需要当前模型配置，因此由 App
+                    // 在只读连接和后台车道启动前完成并写入迁移标记。
+                    try connection.execute("PRAGMA user_version = 8")
                 }
             }
         }

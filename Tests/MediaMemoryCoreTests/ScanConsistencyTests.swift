@@ -3,7 +3,7 @@ import Foundation
 import XCTest
 
 final class ScanConsistencyTests: XCTestCase {
-    func testRealVersionSixSchemaMigratesLegacySegmentsToActiveVersionSeven() async throws {
+    func testRealVersionSixSchemaMigratesLegacySegmentsToActiveVersionEight() async throws {
         let temporary = try ScanTemporaryDirectory()
         let url = temporary.url.appending(path: "real-v6.sqlite")
         do {
@@ -81,7 +81,7 @@ final class ScanConsistencyTests: XCTestCase {
         let inspection = try SQLiteConnection(url: url)
         let version = try inspection.prepare("PRAGMA user_version")
         XCTAssertTrue(try version.step())
-        XCTAssertEqual(version.integer(at: 0), 7)
+        XCTAssertEqual(version.integer(at: 0), 8)
         let active = try inspection.prepare(
             "SELECT is_active, segmentation_run_id FROM segment WHERE id = 'segment-v6'"
         )
