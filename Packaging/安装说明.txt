@@ -1,0 +1,11 @@
+Media Memory 安装说明
+
+1. 将“Media Memory.app”拖到“Applications”文件夹。
+2. 首次打开时，macOS 会提示无法验证开发者。这是因为本个人开源项目未购买
+   Apple Developer Program，也未提交 Apple 公证。
+3. 打开“系统设置”→“隐私与安全”，在安全提示下点击“仍要打开”，然后确认。
+4. 在应用右上角打开“模型设置”，填写各模型的请求 URL、模型名称和 API key，
+   逐项测试成功后保存。
+5. 添加本地或 NAS 目录/视频，即可开始建库和搜索。
+
+源码与校验值：https://github.com/NimbuSHh/media-memory

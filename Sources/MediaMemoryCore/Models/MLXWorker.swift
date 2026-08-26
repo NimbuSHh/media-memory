@@ -33,21 +33,21 @@ public enum MLXWorkerError: Error, LocalizedError, Sendable {
     public var errorDescription: String? {
         switch self {
         case let .missingExecutable(path):
-            "找不到 oMLX Worker 运行入口：\(path)"
+            "找不到本地模型 Worker 运行入口：\(path)"
         case let .missingModel(path):
             "找不到已部署模型：\(path)"
         case .terminated:
-            "MLX Worker 已意外退出。"
+            "本地模型 Worker 已意外退出。"
         case .busy:
-            "MLX Worker 正在处理另一个请求。"
+            "本地模型 Worker 正在处理另一个请求。"
         case .timedOut:
-            "MLX Worker 处理超时，已自动终止；可以直接重试。"
+            "本地模型 Worker 处理超时，已自动终止；可以直接重试。"
         case .invalidResponse:
-            "MLX Worker 返回了无效数据。"
+            "本地模型 Worker 返回了无效数据。"
         case let .invalidResponseDetails(message):
-            "MLX Worker 返回数据无法解析：\(message)"
+            "本地模型 Worker 返回数据无法解析：\(message)"
         case let .operationFailed(message):
-            "MLX Worker 处理失败：\(message)"
+            "本地模型 Worker 处理失败：\(message)"
         }
     }
 }

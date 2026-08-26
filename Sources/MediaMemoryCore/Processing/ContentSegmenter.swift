@@ -50,6 +50,7 @@ public actor ContentSegmenter {
     public static let algorithmFamily = "semantic-v2-visual-silence-v2"
 
     private let database: MediaDatabase
+    private let sourceCache: LocalSourceCache
     private let featureConfiguration: TimelineFeatureExtractionConfiguration
     private let planner: SemanticSegmentPlanner
     private let extractFeatures: FeatureExtractor
@@ -58,6 +59,7 @@ public actor ContentSegmenter {
 
     public init(
         database: MediaDatabase,
+        sourceCache: LocalSourceCache,
         featureConfiguration: TimelineFeatureExtractionConfiguration = .init(),
         planner: SemanticSegmentPlanner = .init(),
         extractFeatures: @escaping FeatureExtractor = { url, configuration in
@@ -71,6 +73,7 @@ public actor ContentSegmenter {
             featureConfiguration
         )
         self.database = database
+        self.sourceCache = sourceCache
         self.featureConfiguration = effectiveConfiguration
         self.planner = planner
         self.extractFeatures = extractFeatures
@@ -115,7 +118,10 @@ public actor ContentSegmenter {
 
         laneLoop: while !Task.isCancelled {
             let target: AssetSegmentationTarget
-            switch try await database.claimNextSegmentationJob() {
+            let cachedAssetID = await sourceCache.cachedAssetID()
+            switch try await database.claimNextSegmentationJob(
+                restrictToAssetID: cachedAssetID
+            ) {
             case let .target(value):
                 target = value
             case .idle:
@@ -123,47 +129,10 @@ public actor ContentSegmenter {
             }
 
             do {
-                try await stage("analyzing", target: target, onEvent: onEvent)
-                let sourceURL = URL(fileURLWithPath: target.asset.standardizedPath)
-                try verifySource(target.asset, at: sourceURL)
-
-                let features = try await AsyncTimeout.run(
-                    for: analysisTimeout(durationMS: target.asset.durationMS),
-                    operationName: "分析视频分片边界"
-                ) { [featureConfiguration, extractFeatures] in
-                    try await extractFeatures(sourceURL, featureConfiguration)
+                try await sourceCache.withLocalURL(for: target.asset) { [self] _ in
+                    try await process(target: target, onEvent: onEvent)
                 }
-                try Task.checkCancellation()
-                try verifySource(target.asset, at: sourceURL)
-
-                try await stage("planning", target: target, onEvent: onEvent)
-                let candidates = features.candidates.compactMap(Self.boundaryCandidate)
-                let observations = features.candidates.map(Self.boundaryObservation)
-                let planned = planner.plan(
-                    SemanticSegmentationInput(
-                        // The database duration is the authoritative coverage
-                        // bound. Detector PTS values are clamped by the planner.
-                        durationMS: target.asset.durationMS,
-                        boundaryCandidates: candidates
-                    )
-                )
-                guard !planned.isEmpty else { throw ContentSegmenterError.noSegments }
-                let drafts = planned.map {
-                    SemanticSegmentDraft(startMS: $0.startMS, endMS: $0.endMS)
-                }
-
-                try await stage("committing", target: target, onEvent: onEvent)
-                try await database.commitSegmentation(
-                    claim: target.job.claimToken,
-                    assetID: target.asset.id,
-                    sourceFingerprint: target.asset.fingerprint,
-                    algorithmVersion: algorithmVersion,
-                    parametersJSON: parametersJSON,
-                    segments: drafts,
-                    observations: observations
-                )
                 succeeded += 1
-                await publish(target: target, stage: "complete", onEvent: onEvent)
             } catch is CancellationError {
                 try? await database.returnSegmentationJobToQueue(
                     claim: target.job.claimToken
@@ -199,6 +168,50 @@ public actor ContentSegmenter {
         return IndexRunSummary(succeeded: succeeded, failed: failed)
     }
 
+    private func process(
+        target: AssetSegmentationTarget,
+        onEvent: EventHandler?
+    ) async throws {
+        try await stage("analyzing", target: target, onEvent: onEvent)
+        let features = try await AsyncTimeout.run(
+            for: analysisTimeout(durationMS: target.asset.durationMS),
+            operationName: "分析视频分片边界"
+        ) { [sourceCache, featureConfiguration, extractFeatures] in
+            try await sourceCache.withLocalURL(for: target.asset) { sourceURL in
+                try await extractFeatures(sourceURL, featureConfiguration)
+            }
+        }
+        try Task.checkCancellation()
+
+        try await stage("planning", target: target, onEvent: onEvent)
+        let candidates = features.candidates.compactMap(Self.boundaryCandidate)
+        let observations = features.candidates.map(Self.boundaryObservation)
+        let planned = planner.plan(
+            SemanticSegmentationInput(
+                // The database duration is the authoritative coverage bound.
+                // Detector PTS values are clamped by the planner.
+                durationMS: target.asset.durationMS,
+                boundaryCandidates: candidates
+            )
+        )
+        guard !planned.isEmpty else { throw ContentSegmenterError.noSegments }
+        let drafts = planned.map {
+            SemanticSegmentDraft(startMS: $0.startMS, endMS: $0.endMS)
+        }
+
+        try await stage("committing", target: target, onEvent: onEvent)
+        try await database.commitSegmentation(
+            claim: target.job.claimToken,
+            assetID: target.asset.id,
+            sourceFingerprint: target.asset.fingerprint,
+            algorithmVersion: algorithmVersion,
+            parametersJSON: parametersJSON,
+            segments: drafts,
+            observations: observations
+        )
+        await publish(target: target, stage: "complete", onEvent: onEvent)
+    }
+
     private func stage(
         _ value: String,
         target: AssetSegmentationTarget,
@@ -228,12 +241,6 @@ public actor ContentSegmenter {
                 progress: progress
             )
         )
-    }
-
-    private func verifySource(_ asset: MediaAssetRecord, at url: URL) throws {
-        let snapshot = try FileFingerprint.snapshot(for: url)
-        let current = try FileFingerprint.lightFingerprint(for: url, snapshot: snapshot)
-        guard current == asset.fingerprint else { throw ContentSegmenterError.sourceChanged }
     }
 
     private func analysisTimeout(durationMS: Int64) -> Duration {

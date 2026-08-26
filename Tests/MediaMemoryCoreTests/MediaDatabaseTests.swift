@@ -900,7 +900,7 @@ final class MediaDatabaseTests: XCTestCase {
         XCTAssertEqual(description.asset.id, target.asset.id)
     }
 
-    func testEvidenceAndDescriptionLanesClaimIndependently() async throws {
+    func testAllLanesStayOnOneAssetUntilItsDescriptionCompletes() async throws {
         let temporary = try TemporaryDirectory()
         let database = try MediaDatabase(url: temporary.url.appending(path: "test.sqlite"))
         let root = try await database.addLibraryRoot(
@@ -959,13 +959,109 @@ final class MediaDatabaseTests: XCTestCase {
         let describeTarget = try unwrapTarget(try await database.claimNextDescribeJob())
         XCTAssertEqual(describeTarget.asset.relativePath, "a.mp4")
 
-        // a 的描述仍在 running 时，证据车道独立认领 b，不受描述阻塞。
-        let second = try unwrapTarget(try await database.claimNextIndexJob())
-        XCTAssertEqual(second.asset.relativePath, "b.mp4")
+        // a 的描述仍在 running 时，后续视频不能抢跑。
+        let blockedClaim = try await database.claimNextIndexJob()
+        XCTAssertEqual(blockedClaim, .idle)
         let progress = try await database.describeProgress()
         XCTAssertEqual(progress.running, 1)
 
         try await commitTestDescription(database: database, target: describeTarget)
+
+        // a 的所有工作完成后，证据车道才进入 b。
+        let second = try unwrapTarget(try await database.claimNextIndexJob())
+        XCTAssertEqual(second.asset.relativePath, "b.mp4")
+
+        try await database.commitIndexOutput(
+            claim: second.job.claimToken,
+            segmentID: second.segment.id,
+            output: SegmentIndexOutput(
+                sourceFingerprint: second.asset.fingerprint,
+                transcripts: [],
+                ocr: [],
+                frames: [
+                    SegmentFrameDraft(
+                        timeMS: 0,
+                        relativePath: "Frames/g/01.jpg",
+                        perceptualHash: 2
+                    )
+                ],
+                embedding: EmbeddingVector(values: [0.6, 0.8], norm: 1),
+                asrModelID: "asr-model",
+                alignerModelID: "aligner-model",
+                embeddingModelID: "embedding-model",
+                runtimeVersion: "test"
+            ),
+            inputVersion: "pipeline-v1"
+        )
+        try await database.reconcileDescribeJobs()
+        try await database.requeueSegmentIndexJob(segmentID: first.segment.id)
+
+        // 即使更早路径 a 被临时重排，持有 b 本地缓存时仍须先完成 b。
+        let blockedByCachedAsset = try await database.claimNextIndexJob(
+            restrictToAssetID: second.asset.id
+        )
+        XCTAssertEqual(blockedByCachedAsset, .idle)
+        let secondDescription = try unwrapTarget(
+            try await database.claimNextDescribeJob(restrictToAssetID: second.asset.id)
+        )
+        XCTAssertEqual(secondDescription.asset.relativePath, "b.mp4")
+    }
+
+    func testRunningUnavailableAssetKeepsOwnershipBeforeCacheMaterializes() async throws {
+        let temporary = try TemporaryDirectory()
+        let database = try MediaDatabase(url: temporary.url.appending(path: "test.sqlite"))
+        let root = try await database.addLibraryRoot(
+            path: temporary.url.path,
+            bookmark: Data([91])
+        )
+        let firstAsset = sampleAsset(
+            relativePath: "a.mp4",
+            durationMS: 10_000,
+            fingerprint: "a-fingerprint",
+            fileIdentifier: "a-file"
+        )
+        let secondAsset = sampleAsset(
+            relativePath: "b.mp4",
+            durationMS: 10_000,
+            fingerprint: "b-fingerprint",
+            fileIdentifier: "b-file"
+        )
+        try await database.applyScan(
+            rootID: root.id,
+            result: MediaScanResult(
+                assets: [firstAsset, secondAsset],
+                unstableFileCount: 0,
+                skippedFileCount: 0,
+                errors: []
+            )
+        )
+        try await database.reconcileIndexJobs(
+            embeddingModelID: "embedding-model",
+            inputVersion: "pipeline-v1"
+        )
+        let running = try unwrapTarget(try await database.claimNextIndexJob())
+        XCTAssertEqual(running.asset.relativePath, "a.mp4")
+
+        try await database.applyScan(
+            rootID: root.id,
+            result: MediaScanResult(
+                assets: [secondAsset],
+                unstableFileCount: 0,
+                skippedFileCount: 0,
+                errors: []
+            )
+        )
+        let ownerWhileUnavailable = try await database.activeProcessingAssetID()
+        XCTAssertEqual(ownerWhileUnavailable, running.asset.id)
+        let blocked = try await database.claimNextIndexJob()
+        XCTAssertEqual(blocked, .idle)
+
+        try await database.returnIndexJobToQueue(
+            claim: running.job.claimToken,
+            stage: "target_unavailable"
+        )
+        let next = try unwrapTarget(try await database.claimNextIndexJob())
+        XCTAssertEqual(next.asset.relativePath, "b.mp4")
     }
 
     func testDescriptionCommitRejectsChangedEvidenceRevision() async throws {

@@ -3,6 +3,108 @@ import Foundation
 import XCTest
 
 final class SegmentationPipelineTests: XCTestCase {
+    func testSegmentationCannotAdvanceToSecondVideoWhileFirstIsRunning() async throws {
+        let temporary = try SegmentationTemporaryDirectory()
+        let database = try MediaDatabase(url: temporary.url.appending(path: "test.sqlite"))
+        let root = try await database.addLibraryRoot(path: temporary.url.path, bookmark: Data([3]))
+        try await database.applyScan(
+            rootID: root.id,
+            result: MediaScanResult(
+                assets: [
+                    scannedAsset(path: "/tmp/a.mp4", durationMS: 10_000, fingerprint: "a"),
+                    scannedAsset(path: "/tmp/b.mp4", durationMS: 10_000, fingerprint: "b")
+                ],
+                unstableFileCount: 0,
+                skippedFileCount: 0,
+                errors: []
+            )
+        )
+        _ = try await database.reconcileSegmentationJobs(algorithmVersion: "semantic-test")
+
+        let first = try segmentationTarget(try await database.claimNextSegmentationJob())
+        XCTAssertEqual(first.asset.relativePath, "a.mp4")
+        let blocked = try await database.claimNextSegmentationJob()
+        XCTAssertEqual(blocked, .idle)
+
+        try await database.failSegmentationJob(claim: first.job.claimToken, message: "fixture")
+        let second = try segmentationTarget(try await database.claimNextSegmentationJob())
+        XCTAssertEqual(second.asset.relativePath, "b.mp4")
+    }
+
+    func testMissingDownstreamJobKeepsCurrentVideoUntilPipelineIsTerminal() async throws {
+        let temporary = try SegmentationTemporaryDirectory()
+        let database = try MediaDatabase(url: temporary.url.appending(path: "test.sqlite"))
+        let root = try await database.addLibraryRoot(path: temporary.url.path, bookmark: Data([4]))
+        try await database.applyScan(
+            rootID: root.id,
+            result: MediaScanResult(
+                assets: [
+                    scannedAsset(
+                        path: "/tmp/reconciliation-window.mp4",
+                        durationMS: 10_000,
+                        fingerprint: "stable"
+                    )
+                ],
+                unstableFileCount: 0,
+                skippedFileCount: 0,
+                errors: []
+            )
+        )
+        _ = try await database.reconcileSegmentationJobs(algorithmVersion: "semantic-test")
+        let segmentation = try segmentationTarget(try await database.claimNextSegmentationJob())
+        try await database.commitSegmentation(
+            claim: segmentation.job.claimToken,
+            assetID: segmentation.asset.id,
+            sourceFingerprint: segmentation.asset.fingerprint,
+            algorithmVersion: "semantic-test",
+            parametersJSON: "{\"algorithm_version\":\"semantic-test\"}",
+            segments: [.init(startMS: 0, endMS: 10_000)]
+        )
+
+        let activeBeforeEvidenceReconcile = try await database.hasActiveProcessingWork(
+            assetID: segmentation.asset.id,
+            requiresEvidence: true,
+            requiresDescriptions: true
+        )
+        XCTAssertTrue(
+            activeBeforeEvidenceReconcile,
+            "分片已提交但证据任务尚未补齐时，视频不能被判定完成"
+        )
+
+        try await database.reconcileIndexJobs(
+            embeddingModelID: "embedding-model",
+            inputVersion: "pipeline-v1"
+        )
+        let evidence = try indexTarget(try await database.claimNextIndexJob())
+        try await commitIndex(database: database, target: evidence, text: "evidence")
+        _ = try await database.activateReadySegmentation(assetID: segmentation.asset.id)
+        let activeBeforeDescriptionReconcile = try await database.hasActiveProcessingWork(
+            assetID: segmentation.asset.id,
+            requiresEvidence: true,
+            requiresDescriptions: true
+        )
+        XCTAssertTrue(
+            activeBeforeDescriptionReconcile,
+            "证据已提交但描述任务尚未补齐时，视频不能被判定完成"
+        )
+
+        try await database.reconcileDescribeJobs()
+        let description = try indexTarget(try await database.claimNextDescribeJob())
+        try await database.failIndexJob(
+            claim: description.job.claimToken,
+            message: "terminal fixture"
+        )
+        let activeAfterTerminalFailure = try await database.hasActiveProcessingWork(
+            assetID: segmentation.asset.id,
+            requiresEvidence: true,
+            requiresDescriptions: true
+        )
+        XCTAssertFalse(
+            activeAfterTerminalFailure,
+            "描述失败也是终态，不应永久保留整段源视频"
+        )
+    }
+
     func testPlannerConfigurationChangeCreatesANewSegmentationGeneration() async throws {
         let temporary = try SegmentationTemporaryDirectory()
         let source = temporary.url.appending(path: "planner-config.bin")
@@ -23,7 +125,16 @@ final class SegmentationPipelineTests: XCTestCase {
         let extractor: ContentSegmenter.FeatureExtractor = { _, _ in
             TimelineFeatureExtractionResult(durationMS: 20_000, candidates: [])
         }
-        let first = ContentSegmenter(database: database, extractFeatures: extractor)
+        let sourceCache = LocalSourceCache(
+            workRoot: temporary.url,
+            minimumFreeBytes: 0,
+            availableCapacity: { _ in Int64.max }
+        )
+        let first = ContentSegmenter(
+            database: database,
+            sourceCache: sourceCache,
+            extractFeatures: extractor
+        )
         let firstSummary = try await first.runUntilIdle()
         XCTAssertEqual(firstSummary.succeeded, 1)
 
@@ -37,6 +148,7 @@ final class SegmentationPipelineTests: XCTestCase {
         )
         let changed = ContentSegmenter(
             database: database,
+            sourceCache: sourceCache,
             planner: changedPlanner,
             extractFeatures: extractor
         )
@@ -225,7 +337,12 @@ final class SegmentationPipelineTests: XCTestCase {
                 errors: []
             )
         )
-        let segmenter = ContentSegmenter(database: database) { _, _ in
+        let sourceCache = LocalSourceCache(
+            workRoot: temporary.url,
+            minimumFreeBytes: 0,
+            availableCapacity: { _ in Int64.max }
+        )
+        let segmenter = ContentSegmenter(database: database, sourceCache: sourceCache) { _, _ in
             throw SegmentationFixtureError.detectorFailed
         }
 
@@ -272,7 +389,12 @@ final class SegmentationPipelineTests: XCTestCase {
             )
         )
 
-        let segmenter = ContentSegmenter(database: database) { _, _ in
+        let sourceCache = LocalSourceCache(
+            workRoot: temporary.url,
+            minimumFreeBytes: 0,
+            availableCapacity: { _ in Int64.max }
+        )
+        let segmenter = ContentSegmenter(database: database, sourceCache: sourceCache) { _, _ in
             TimelineFeatureExtractionResult(
                 durationMS: 45_000,
                 candidates: [
@@ -504,7 +626,7 @@ final class SegmentationPipelineTests: XCTestCase {
         ScannedMediaAsset(
             relativePath: (path as NSString).lastPathComponent,
             standardizedPath: path,
-            fileIdentifier: "segmentation-file-id",
+            fileIdentifier: "segmentation-\((path as NSString).lastPathComponent)",
             fileSize: 1_024,
             modificationDate: Date(timeIntervalSince1970: 1_700_000_000),
             durationMS: durationMS,

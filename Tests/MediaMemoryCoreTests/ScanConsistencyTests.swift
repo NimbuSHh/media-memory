@@ -245,8 +245,23 @@ final class ScanConsistencyTests: XCTestCase {
         guard case let .target(running) = try await database.claimNextIndexJob() else {
             return XCTFail("预期可认领建库任务")
         }
+        let activeBeforeMissing = try await database.hasActiveProcessingWork(
+            assetID: running.asset.id,
+            requiresEvidence: true,
+            requiresDescriptions: true
+        )
+        XCTAssertTrue(activeBeforeMissing)
 
         try await database.applyScan(rootID: root.id, result: completeResult(assets: []))
+        let activeWhileMissing = try await database.hasActiveProcessingWork(
+            assetID: running.asset.id,
+            requiresEvidence: true,
+            requiresDescriptions: true
+        )
+        XCTAssertTrue(
+            activeWhileMissing,
+            "资产暂时不可用时，运行中的读取任务仍必须阻止缓存清理"
+        )
         do {
             try await database.commitIndexOutput(
                 claim: running.job.claimToken,
@@ -271,6 +286,15 @@ final class ScanConsistencyTests: XCTestCase {
         try await database.returnIndexJobToQueue(
             claim: running.job.claimToken,
             stage: "target_unavailable"
+        )
+        let activeAfterReturn = try await database.hasActiveProcessingWork(
+            assetID: running.asset.id,
+            requiresEvidence: true,
+            requiresDescriptions: true
+        )
+        XCTAssertFalse(
+            activeAfterReturn,
+            "不可用资产的运行任务退出后不应无限占用本地缓存"
         )
 
         try await database.applyScan(

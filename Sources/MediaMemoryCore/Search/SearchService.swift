@@ -253,12 +253,12 @@ public actor SearchService {
     ) async throws -> [String: Double] {
         try Task.checkCancellation()
         let revision = try await database.embeddingIndexRevision(
-            modelID: configuration.worker.embeddingModelID,
+            modelID: configuration.embedding.derivationID,
             inputVersion: inputVersion
         )
         if revision != cachedRevision {
             let stored = try await database.storedEmbeddings(
-                modelID: configuration.worker.embeddingModelID,
+                modelID: configuration.embedding.derivationID,
                 inputVersion: inputVersion
             )
             vectorIndex = SemanticVectorIndex(records: stored)

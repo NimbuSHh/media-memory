@@ -24,21 +24,24 @@ public actor DescriptionService {
     private let database: MediaDatabase
     private let configuration: ModelConfiguration
     private let runtime: LocalModelRuntime
+    private let sourceCache: LocalSourceCache
     private let workRoot: URL
 
     public init(
         database: MediaDatabase,
         configuration: ModelConfiguration,
         runtime: LocalModelRuntime,
+        sourceCache: LocalSourceCache,
         workRoot: URL
     ) {
         self.database = database
         self.configuration = configuration
         self.runtime = runtime
+        self.sourceCache = sourceCache
         self.workRoot = workRoot.standardizedFileURL
     }
 
-    public var descriptionModelID: String { configuration.omlx.descriptionModelID }
+    public var descriptionModelID: String { configuration.description.derivationID }
 
     /// 展示用：最新缓存描述，不校验版本；调用方负责提示旧版。
     public func latestDescription(segmentID: String) async throws -> CachedSegmentDescription? {
@@ -70,7 +73,7 @@ public actor DescriptionService {
             segmentID: segmentID,
             sourceFingerprint: prepared.context.asset.fingerprint,
             expectedInputRevision: prepared.revision,
-            modelID: configuration.omlx.descriptionModelID,
+            modelID: configuration.description.derivationID,
             runtimeVersion: SegmentIndexer.runtimeVersion,
             promptVersion: Self.promptVersion,
             inputVersion: prepared.inputVersion,
@@ -110,7 +113,7 @@ public actor DescriptionService {
             segmentID: target.segment.id,
             sourceFingerprint: prepared.context.asset.fingerprint,
             expectedInputRevision: prepared.revision,
-            modelID: configuration.omlx.descriptionModelID,
+            modelID: configuration.description.derivationID,
             runtimeVersion: SegmentIndexer.runtimeVersion,
             promptVersion: Self.promptVersion,
             inputVersion: prepared.inputVersion,
@@ -161,30 +164,34 @@ public actor DescriptionService {
             inputVersion: Self.inputVersion(
                 context: context,
                 frames: frames,
-                modelID: configuration.omlx.descriptionModelID
+                modelID: configuration.description.derivationID
             )
         )
     }
 
     private func generate(_ input: PreparedDescriptionInput) async throws -> SegmentDescription {
-        let timedImages = try input.frames.map { frame in
-            let url = workRoot.appending(path: frame.relativePath).standardizedFileURL
-            guard url.path.hasPrefix(workRoot.path + "/") else {
-                throw DescriptionServiceError.frameOutsideWorkDirectory
+        try await sourceCache.withLocalURL(for: input.context.asset) { [self] sourceURL in
+            let directory = workRoot
+                .appending(path: "DescriptionRuns", directoryHint: .isDirectory)
+                .appending(path: UUID().uuidString, directoryHint: .isDirectory)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let extracted = try await FrameExtractor.extractAtTimes(
+                assetURL: sourceURL,
+                timesMS: input.frames.map(\.timeMS),
+                destinationDirectory: directory
+            )
+            let timedImages = extracted.map {
+                TimedImageInput(timeMS: $0.timeMS, url: $0.imageURL)
             }
-            guard FileManager.default.fileExists(atPath: url.path) else {
-                throw DescriptionServiceError.missingFrames
-            }
-            return TimedImageInput(timeMS: frame.timeMS, url: url)
+            let evidenceText = input.context.evidence.map { evidence in
+                let label = evidence.kind == .transcript ? "ASR" : "OCR"
+                return "[\(label) \(Self.format(evidence.startMS))–\(Self.format(evidence.endMS))] \(evidence.text)"
+            }.joined(separator: "\n")
+            return try await runtime.describe(
+                images: timedImages,
+                evidenceText: evidenceText.isEmpty ? "没有识别到 ASR 或 OCR 文本。" : evidenceText
+            )
         }
-        let evidenceText = input.context.evidence.map { evidence in
-            let label = evidence.kind == .transcript ? "ASR" : "OCR"
-            return "[\(label) \(format(evidence.startMS))–\(format(evidence.endMS))] \(evidence.text)"
-        }.joined(separator: "\n")
-        return try await runtime.describe(
-            images: timedImages,
-            evidenceText: evidenceText.isEmpty ? "没有识别到 ASR 或 OCR 文本。" : evidenceText
-        )
     }
 
     private static func inputVersion(
@@ -204,7 +211,7 @@ public actor DescriptionService {
             .joined()
     }
 
-    private func format(_ milliseconds: Int64) -> String {
+    private nonisolated static func format(_ milliseconds: Int64) -> String {
         String(format: "%.3fs", Double(milliseconds) / 1_000)
     }
 }

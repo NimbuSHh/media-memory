@@ -3,15 +3,42 @@ import Combine
 import Foundation
 import MediaMemoryCore
 
-struct ModelSettingsDraft: Equatable {
-    var baseURL = ""
-    var asrModelID = ""
-    var alignerModelID = ""
-    var embeddingModelID = ""
-    var descriptionModelID = ""
+struct ModelEndpointDraft: Equatable, Hashable, Sendable {
+    var transport: ModelTransport
+    var endpointURL = ""
+    var modelID = ""
+    var apiKey = ""
+}
+
+struct ModelSettingsDraft: Equatable, Sendable {
+    var asr = ModelEndpointDraft(transport: .openAITranscription)
+    var aligner = ModelEndpointDraft(transport: .localWorker)
+    var embedding = ModelEndpointDraft(transport: .localWorker)
+    var description = ModelEndpointDraft(transport: .openAIChatCompletion)
     var pythonLauncherPath = ""
     var modelRootPath = ""
-    var apiKey = ""
+
+    func endpoint(for role: ModelRole) -> ModelEndpointDraft {
+        switch role {
+        case .asr: asr
+        case .aligner: aligner
+        case .embedding: embedding
+        case .description: description
+        }
+    }
+}
+
+enum ModelTestPhase: Equatable {
+    case untested
+    case testing
+    case passed
+    case failed
+}
+
+struct ModelTestState: Equatable {
+    var phase: ModelTestPhase = .untested
+    var message = "未测试"
+    var draftSignature: Int?
 }
 
 /// 视频队列总览：以视频为单位的处理进度。
@@ -92,6 +119,9 @@ final class AppModel: ObservableObject {
     }
     @Published var searchQuery = ""
     @Published var settingsDraft = ModelSettingsDraft()
+    @Published private(set) var modelTestStates = Dictionary(
+        uniqueKeysWithValues: ModelRole.allCases.map { ($0, ModelTestState()) }
+    )
     @Published var isSettingsPresented = false
     @Published private(set) var isScanning = false
     @Published private(set) var isIndexing = false
@@ -99,6 +129,7 @@ final class AppModel: ObservableObject {
     @Published private(set) var isLibraryBusy = false
     @Published private(set) var isSettingsLoading = false
     @Published private(set) var isSavingSettings = false
+    @Published private(set) var isTestingModels = false
     @Published private(set) var startupPhase = AppStartupPhase.loadingLocalData
     @Published private(set) var statusMessage = "正在读取本地数据…"
     @Published private(set) var scanStatusMessage = "扫描空闲"
@@ -116,6 +147,7 @@ final class AppModel: ObservableObject {
     /// much heavier than App snapshots and detail reads.
     private var searchDatabase: MediaDatabase?
     private var workRoot: URL?
+    private var sourceCache: LocalSourceCache?
     private var segmenter: ContentSegmenter?
     private var runtime: LocalModelRuntime?
     private var indexer: SegmentIndexer?
@@ -128,6 +160,8 @@ final class AppModel: ObservableObject {
     private var libraryTask: Task<Void, Never>?
     private var settingsKeyLoadTask: Task<Void, Never>?
     private var settingsSaveTask: Task<Void, Never>?
+    private var modelTestTasks: [ModelRole: Task<Void, Never>] = [:]
+    private var testAllModelsTask: Task<Void, Never>?
     private var scanTask: Task<Void, Never>?
     private var segmentationTask: Task<Void, Never>?
     private var indexTask: Task<Void, Never>?
@@ -168,6 +202,8 @@ final class AppModel: ObservableObject {
         libraryTask?.cancel()
         settingsKeyLoadTask?.cancel()
         settingsSaveTask?.cancel()
+        modelTestTasks.values.forEach { $0.cancel() }
+        testAllModelsTask?.cancel()
         scanTask?.cancel()
         segmentationTask?.cancel()
         indexTask?.cancel()
@@ -280,10 +316,13 @@ final class AppModel: ObservableObject {
     /// 移除一个根（目录或单个文件）：删除其全部记录与派生数据，不触碰源文件。
     func removeRoot(_ root: LibraryRootRecord) {
         runLibraryOperation(status: "正在移除媒体库…") { model in
-            guard let database = model.database, let workRoot = model.workRoot else { return }
+            guard let database = model.database,
+                  let sourceCache = model.sourceCache,
+                  let workRoot = model.workRoot else { return }
             model.isBackgroundControlBarrierActive = true
             await model.pauseScanAndWait()
             await model.pauseIndexingAndWait()
+            try await sourceCache.removeAll()
             defer {
                 model.isBackgroundControlBarrierActive = false
                 model.startIndexing()
@@ -314,10 +353,13 @@ final class AppModel: ObservableObject {
     /// 移除单个视频：保留排除标记防止目录扫描再次纳入，删除其全部派生数据。
     func removeAsset(_ asset: MediaAssetRecord) {
         runLibraryOperation(status: "正在移除视频…") { model in
-            guard let database = model.database, let workRoot = model.workRoot else { return }
+            guard let database = model.database,
+                  let sourceCache = model.sourceCache,
+                  let workRoot = model.workRoot else { return }
             model.isBackgroundControlBarrierActive = true
             await model.pauseScanAndWait()
             await model.pauseIndexingAndWait()
+            try await sourceCache.removeAll()
             defer {
                 model.isBackgroundControlBarrierActive = false
                 model.startIndexing()
@@ -380,7 +422,7 @@ final class AppModel: ObservableObject {
 
     private func displayed(_ cached: CachedSegmentDescription) -> DisplayedSegmentDescription {
         let isStale = cached.promptVersion != DescriptionService.promptVersion
-            || cached.modelID != configuration?.omlx.descriptionModelID
+            || cached.modelID != configuration?.description.derivationID
         return DisplayedSegmentDescription(cached: cached, isStale: isStale)
     }
 
@@ -401,7 +443,7 @@ final class AppModel: ObservableObject {
         runLibraryOperation(status: "正在重新排队旧版描述…") { model in
             guard let database = model.database, let configuration = model.configuration else { return }
             try await database.requeueStaleDescriptions(
-                descriptionModelID: configuration.omlx.descriptionModelID,
+                descriptionModelID: configuration.description.derivationID,
                 promptVersion: DescriptionService.promptVersion
             )
             model.segmentDescriptions = [:]
@@ -469,23 +511,30 @@ final class AppModel: ObservableObject {
     }
 
     func retryFailedEvidenceJobs() {
+        guard segmentationTask == nil, indexTask == nil else { return }
         runLibraryOperation(status: "正在重新排队建库失败任务…") { model in
+            guard let database = model.database else { return }
+            try await database.recoverInterruptedJobs(kind: .segmentAsset)
+            try await database.recoverInterruptedJobs(kind: .indexSegment)
             if let segmenter = model.segmenter {
                 model.segmentationProgress = try await segmenter.retryFailed()
             }
             if let indexer = model.indexer {
                 model.indexingProgress = try await indexer.retryFailed()
             }
-            try await model.refreshJobs()
+            try await model.prepareIndexQueue(autoStart: false)
             model.startEvidenceProcessing()
         }
     }
 
     func retryFailedDescriptionJobs() {
+        guard describeTask == nil else { return }
         runLibraryOperation(status: "正在重新排队描述失败任务…") { model in
-            guard let describeQueue = model.describeQueue else { return }
+            guard let database = model.database,
+                  let describeQueue = model.describeQueue else { return }
+            try await database.recoverInterruptedJobs(kind: .describeSegment)
             model.describeProgress = try await describeQueue.retryFailed()
-            try await model.refreshJobs()
+            try await model.prepareIndexQueue(autoStart: false)
             model.startDescriptionProcessing()
         }
     }
@@ -606,21 +655,20 @@ final class AppModel: ObservableObject {
         guard let configuration else { return }
         settingsKeyLoadTask?.cancel()
         settingsDraft = ModelSettingsDraft(
-            baseURL: configuration.omlx.baseURL.absoluteString,
-            asrModelID: configuration.omlx.asrModelID,
-            alignerModelID: configuration.worker.forcedAlignerModelID,
-            embeddingModelID: configuration.worker.embeddingModelID,
-            descriptionModelID: configuration.omlx.descriptionModelID,
-            pythonLauncherPath: configuration.worker.pythonLauncherPath,
-            modelRootPath: configuration.worker.modelRootPath,
-            apiKey: ""
+            asr: Self.endpointDraft(configuration.asr),
+            aligner: Self.endpointDraft(configuration.aligner),
+            embedding: Self.endpointDraft(configuration.embedding),
+            description: Self.endpointDraft(configuration.description),
+            pythonLauncherPath: configuration.localWorker?.pythonLauncherPath ?? "",
+            modelRootPath: configuration.localWorker?.modelRootPath ?? ""
         )
+        resetModelTestStates()
         isSettingsPresented = true
         isSettingsLoading = true
         settingsKeyLoadTask = Task { [weak self] in
-            let key: String?
+            let credentials: ModelCredentials
             do {
-                key = try await KeychainStore.loadOMLXKeyAsync()
+                credentials = try await KeychainStore.loadModelCredentialsAsync()
             } catch is CancellationError {
                 return
             } catch {
@@ -631,14 +679,20 @@ final class AppModel: ObservableObject {
                 return
             }
             guard !Task.isCancelled, let self, self.isSettingsPresented else { return }
-            self.settingsDraft.apiKey = key ?? ""
+            self.settingsDraft.asr.apiKey = credentials.asr
+            self.settingsDraft.aligner.apiKey = credentials.aligner
+            self.settingsDraft.embedding.apiKey = credentials.embedding
+            self.settingsDraft.description.apiKey = credentials.description
             self.isSettingsLoading = false
             self.settingsKeyLoadTask = nil
         }
     }
 
     func saveSettings() {
-        guard settingsSaveTask == nil, libraryTask == nil, !isSettingsLoading else {
+        guard settingsSaveTask == nil,
+              libraryTask == nil,
+              !isSettingsLoading,
+              !isTestingModels else {
             statusMessage = isSettingsLoading ? "正在读取钥匙串…" : "另一项设置或媒体库操作尚未完成"
             return
         }
@@ -653,8 +707,199 @@ final class AppModel: ObservableObject {
         guard !isSavingSettings else { return }
         settingsKeyLoadTask?.cancel()
         settingsKeyLoadTask = nil
+        cancelModelTests()
         isSettingsLoading = false
         isSettingsPresented = false
+    }
+
+    func modelTestState(for role: ModelRole) -> ModelTestState {
+        let state = modelTestStates[role] ?? ModelTestState()
+        guard state.draftSignature == modelTestSignature(for: role, draft: settingsDraft) else {
+            return ModelTestState()
+        }
+        return state
+    }
+
+    func testModel(_ role: ModelRole) {
+        guard !isSettingsLoading,
+              !isSavingSettings,
+              testAllModelsTask == nil,
+              modelTestTasks[role] == nil,
+              let workRoot else { return }
+        let draft = settingsDraft
+        let configuration = Self.configuration(from: draft)
+        let credentials = Self.credentials(from: draft)
+        let signature = modelTestSignature(for: role, draft: draft)
+        modelTestStates[role] = ModelTestState(
+            phase: .testing,
+            message: "正在发送真实测试请求…",
+            draftSignature: signature
+        )
+        isTestingModels = true
+        modelTestTasks[role] = Task { [weak self] in
+            guard let self else { return }
+            defer {
+                self.modelTestTasks[role] = nil
+                self.isTestingModels = !self.modelTestTasks.isEmpty || self.testAllModelsTask != nil
+            }
+            do {
+                let report = try await ModelCapabilityTester.test(
+                    role: role,
+                    configuration: configuration,
+                    credentials: credentials,
+                    workRoot: workRoot
+                )
+                guard !Task.isCancelled else { return }
+                guard self.modelTestSignature(for: role, draft: self.settingsDraft) == signature else {
+                    self.modelTestStates[role] = ModelTestState()
+                    return
+                }
+                self.modelTestStates[role] = ModelTestState(
+                    phase: .passed,
+                    message: report.detail,
+                    draftSignature: signature
+                )
+            } catch is CancellationError {
+                self.modelTestStates[role] = ModelTestState()
+            } catch {
+                self.modelTestStates[role] = ModelTestState(
+                    phase: .failed,
+                    message: Self.sanitizedModelTestError(error, credentials: credentials),
+                    draftSignature: signature
+                )
+            }
+        }
+    }
+
+    /// Runs serially to avoid loading several large models into unified memory at once.
+    func testAllModels() {
+        guard !isSettingsLoading,
+              !isSavingSettings,
+              !isTestingModels,
+              let workRoot else { return }
+        let draft = settingsDraft
+        let configuration = Self.configuration(from: draft)
+        let credentials = Self.credentials(from: draft)
+        isTestingModels = true
+        testAllModelsTask = Task { [weak self] in
+            guard let self else { return }
+            for role in ModelRole.allCases {
+                guard !Task.isCancelled else { break }
+                let signature = self.modelTestSignature(for: role, draft: draft)
+                self.modelTestStates[role] = ModelTestState(
+                    phase: .testing,
+                    message: "正在发送真实测试请求…",
+                    draftSignature: signature
+                )
+                do {
+                    let report = try await ModelCapabilityTester.test(
+                        role: role,
+                        configuration: configuration,
+                        credentials: credentials,
+                        workRoot: workRoot
+                    )
+                    guard self.modelTestSignature(for: role, draft: self.settingsDraft) == signature else {
+                        self.modelTestStates[role] = ModelTestState()
+                        continue
+                    }
+                    self.modelTestStates[role] = ModelTestState(
+                        phase: .passed,
+                        message: report.detail,
+                        draftSignature: signature
+                    )
+                } catch is CancellationError {
+                    self.modelTestStates[role] = ModelTestState()
+                    break
+                } catch {
+                    self.modelTestStates[role] = ModelTestState(
+                        phase: .failed,
+                        message: Self.sanitizedModelTestError(error, credentials: credentials),
+                        draftSignature: signature
+                    )
+                }
+            }
+            self.testAllModelsTask = nil
+            self.isTestingModels = false
+        }
+    }
+
+    private func cancelModelTests() {
+        modelTestTasks.values.forEach { $0.cancel() }
+        modelTestTasks.removeAll()
+        testAllModelsTask?.cancel()
+        testAllModelsTask = nil
+        isTestingModels = false
+        resetModelTestStates()
+    }
+
+    private func resetModelTestStates() {
+        modelTestStates = Dictionary(
+            uniqueKeysWithValues: ModelRole.allCases.map { ($0, ModelTestState()) }
+        )
+    }
+
+    private func modelTestSignature(for role: ModelRole, draft: ModelSettingsDraft) -> Int {
+        var hasher = Hasher()
+        hasher.combine(draft.endpoint(for: role))
+        if draft.endpoint(for: role).transport == .localWorker {
+            hasher.combine(draft.pythonLauncherPath)
+            hasher.combine(draft.modelRootPath)
+        }
+        return hasher.finalize()
+    }
+
+    private nonisolated static func endpointDraft(_ endpoint: ModelEndpoint) -> ModelEndpointDraft {
+        ModelEndpointDraft(
+            transport: endpoint.transport,
+            endpointURL: endpoint.endpointURL?.absoluteString ?? "",
+            modelID: endpoint.modelID,
+            apiKey: ""
+        )
+    }
+
+    private nonisolated static func configuration(from draft: ModelSettingsDraft) -> ModelConfiguration {
+        func endpoint(_ value: ModelEndpointDraft) -> ModelEndpoint {
+            let urlText = value.endpointURL.trimmingCharacters(in: .whitespacesAndNewlines)
+            return ModelEndpoint(
+                transport: value.transport,
+                endpointURL: value.transport.requiresEndpoint ? URL(string: urlText) : nil,
+                modelID: value.modelID.trimmingCharacters(in: .whitespacesAndNewlines)
+            )
+        }
+        let worker = ModelConfiguration.Worker(
+            forcedAlignerModelID: draft.aligner.modelID.trimmingCharacters(in: .whitespacesAndNewlines),
+            embeddingModelID: draft.embedding.modelID.trimmingCharacters(in: .whitespacesAndNewlines),
+            pythonLauncherPath: draft.pythonLauncherPath.trimmingCharacters(in: .whitespacesAndNewlines),
+            modelRootPath: draft.modelRootPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        )
+        return ModelConfiguration(
+            asr: endpoint(draft.asr),
+            aligner: endpoint(draft.aligner),
+            embedding: endpoint(draft.embedding),
+            description: endpoint(draft.description),
+            localWorker: worker
+        )
+    }
+
+    private nonisolated static func credentials(from draft: ModelSettingsDraft) -> ModelCredentials {
+        ModelCredentials(
+            asr: draft.asr.apiKey.trimmingCharacters(in: .whitespacesAndNewlines),
+            aligner: draft.aligner.apiKey.trimmingCharacters(in: .whitespacesAndNewlines),
+            embedding: draft.embedding.apiKey.trimmingCharacters(in: .whitespacesAndNewlines),
+            description: draft.description.apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        )
+    }
+
+    private nonisolated static func sanitizedModelTestError(
+        _ error: Error,
+        credentials: ModelCredentials
+    ) -> String {
+        var message = error.localizedDescription
+        for role in ModelRole.allCases {
+            let key = credentials[role]
+            if !key.isEmpty { message = message.replacingOccurrences(of: key, with: "[已隐藏]") }
+        }
+        return String(message.prefix(2_000))
     }
 
     func clearError() {
@@ -686,7 +931,12 @@ final class AppModel: ObservableObject {
             readDatabase = core.readDatabase
             searchDatabase = core.searchDatabase
             workRoot = core.workRoot
-            segmenter = ContentSegmenter(database: core.database)
+            let sourceCache = LocalSourceCache(workRoot: core.workRoot)
+            self.sourceCache = sourceCache
+            segmenter = ContentSegmenter(
+                database: core.database,
+                sourceCache: sourceCache
+            )
             // Search is available as soon as local data is open. A configured
             // runtime later enriches it with semantic ranking, but FTS never
             // waits for model setup or background indexing lifecycle.
@@ -749,14 +999,11 @@ final class AppModel: ObservableObject {
 
     /// 后台维护：孤儿文件清扫、书签解析与续期、服务配置、车道启动。
     private func bootstrapMaintenance(generation: Int) async {
-        guard let database, let searchDatabase, let workRoot else { return }
+        guard let database, let searchDatabase, let sourceCache, let workRoot else { return }
         do {
             try await recoverInterruptedJobsIfNeeded()
             try Task.checkCancellation()
             segmentationProgress = try await segmenter?.prepareQueue() ?? segmentationProgress
-            if scanTask == nil, libraryTask == nil, settingsSaveTask == nil {
-                startSegmentationLane()
-            }
             try Task.checkCancellation()
             // Queue reconciliation is local database maintenance, not model
             // work. Run it before Keychain/runtime setup so legacy saved
@@ -770,12 +1017,14 @@ final class AppModel: ObservableObject {
             try Task.checkCancellation()
             guard generation == serviceGeneration else { return }
             guard let configuration else { return }
-            if let apiKey = try await KeychainStore.loadOMLXKeyAsync(), !apiKey.isEmpty {
+            do {
+                let credentials = try await KeychainStore.loadModelCredentialsAsync()
                 let services = try await Self.makeServices(
                     configuration: configuration,
-                    apiKey: apiKey,
+                    credentials: credentials,
                     database: database,
                     searchDatabase: searchDatabase,
+                    sourceCache: sourceCache,
                     workRoot: workRoot
                 )
                 try Task.checkCancellation()
@@ -784,8 +1033,9 @@ final class AppModel: ObservableObject {
                 try await prepareIndexQueue(
                     autoStart: scanTask == nil && libraryTask == nil && settingsSaveTask == nil
                 )
-            } else if !roots.isEmpty {
-                statusMessage = "全文搜索已可用；配置 oMLX 后启用语义检索和后台建库"
+            } catch {
+                statusMessage = "本地浏览和字面搜索已可用；请在模型设置中检查服务"
+                errorMessage = "模型服务尚未就绪：\(error.localizedDescription)"
             }
             if generation == serviceGeneration { maintenanceTask = nil }
         } catch is CancellationError {
@@ -805,9 +1055,19 @@ final class AppModel: ObservableObject {
         try Task.checkCancellation()
         try ApplicationPaths.cleanupAbandonedPrefetch(in: workRoot)
         try Task.checkCancellation()
+        try ApplicationPaths.cleanupAbandonedDescriptionRuns(in: workRoot)
+        try Task.checkCancellation()
+        try ApplicationPaths.cleanupAbandonedSourceCache(in: workRoot)
+        try Task.checkCancellation()
+        let referencedFrames = try await database.referencedFrameRelativePaths()
         try ApplicationPaths.cleanupUnreferencedFrames(
             in: workRoot,
-            referencedRelativePaths: try await database.referencedFrameRelativePaths()
+            referencedRelativePaths: referencedFrames
+        )
+        try Task.checkCancellation()
+        try ApplicationPaths.compactReferencedFrames(
+            in: workRoot,
+            referencedRelativePaths: referencedFrames
         )
     }
 
@@ -860,15 +1120,11 @@ final class AppModel: ObservableObject {
             settingsSaveTask = nil
         }
         do {
-            guard let baseURL = URL(string: draft.baseURL),
-                  ["http", "https"].contains(baseURL.scheme?.lowercased() ?? ""),
-                  !draft.asrModelID.isEmpty,
-                  !draft.alignerModelID.isEmpty,
-                  !draft.embeddingModelID.isEmpty,
-                  !draft.descriptionModelID.isEmpty else {
-                throw SettingsValidationError.invalidValues
-            }
+            let newConfiguration = Self.configuration(from: draft)
+            try newConfiguration.validate()
+            let newCredentials = Self.credentials(from: draft)
             guard let database, let searchDatabase, let workRoot else { return }
+            guard let sourceCache else { return }
             let interruptedMaintenance = maintenanceTask
             interruptedMaintenance?.cancel()
             maintenanceTask = nil
@@ -885,31 +1141,23 @@ final class AppModel: ObservableObject {
             await pauseIndexingAndWait()
             try Task.checkCancellation()
 
-            let newConfiguration = ModelConfiguration(
-                schemaVersion: 1,
-                omlx: .init(
-                    baseURL: baseURL,
-                    asrModelID: draft.asrModelID,
-                    descriptionModelID: draft.descriptionModelID
-                ),
-                worker: .init(
-                    forcedAlignerModelID: draft.alignerModelID,
-                    embeddingModelID: draft.embeddingModelID,
-                    pythonLauncherPath: draft.pythonLauncherPath,
-                    modelRootPath: draft.modelRootPath
-                )
-            )
-            let apiKey = draft.apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
             let services = try await Self.makeServices(
                 configuration: newConfiguration,
-                apiKey: apiKey,
+                credentials: newCredentials,
                 database: database,
                 searchDatabase: searchDatabase,
+                sourceCache: sourceCache,
                 workRoot: workRoot
             )
             try Task.checkCancellation()
-            try await ModelConfigurationStore.saveAsync(newConfiguration)
-            try await KeychainStore.saveOMLXKeyAsync(apiKey)
+            let previousCredentials = try await KeychainStore.loadModelCredentialsAsync()
+            try await KeychainStore.saveModelCredentialsAsync(newCredentials)
+            do {
+                try await ModelConfigurationStore.saveAsync(newConfiguration)
+            } catch {
+                try? await KeychainStore.saveModelCredentialsAsync(previousCredentials)
+                throw error
+            }
             try Task.checkCancellation()
             guard generation == serviceGeneration else { return }
             configuration = newConfiguration
@@ -925,9 +1173,11 @@ final class AppModel: ObservableObject {
                 ? "" : "模型设置已更新，请重新搜索"
             evidenceLaneFailure = nil
             descriptionLaneFailure = nil
+            resetModelTestStates()
             isSettingsPresented = false
             statusMessage = "模型设置已保存"
             try await prepareIndexQueue(autoStart: false)
+            await KeychainStore.deleteLegacyOMLXKeyAsync()
         } catch is CancellationError {
             statusMessage = "模型设置保存已停止"
         } catch {
@@ -937,21 +1187,23 @@ final class AppModel: ObservableObject {
 
     private nonisolated static func makeServices(
         configuration: ModelConfiguration,
-        apiKey: String,
+        credentials: ModelCredentials,
         database: MediaDatabase,
         searchDatabase: MediaDatabase,
+        sourceCache: LocalSourceCache,
         workRoot: URL
     ) async throws -> ConfiguredServices {
         try Task.checkCancellation()
-        let runtime = try LocalModelRuntime(
+        let runtime = try ModelRuntime(
             configuration: configuration,
-            apiKey: apiKey,
+            credentials: credentials,
             workRoot: workRoot
         )
         let indexer = SegmentIndexer(
             database: database,
             configuration: configuration,
             runtime: runtime,
+            sourceCache: sourceCache,
             workRoot: workRoot
         )
         let searchService = SearchService(
@@ -963,11 +1215,13 @@ final class AppModel: ObservableObject {
             database: database,
             configuration: configuration,
             runtime: runtime,
+            sourceCache: sourceCache,
             workRoot: workRoot
         )
         let describeQueue = DescriptionQueue(
             database: database,
-            descriptionService: descriptionService
+            descriptionService: descriptionService,
+            sourceCache: sourceCache
         )
         return ConfiguredServices(
             runtime: runtime,
@@ -1010,7 +1264,7 @@ final class AppModel: ObservableObject {
         jobsRefreshGeneration += 1
         let generation = jobsRefreshGeneration
         async let dashboard = database.jobDashboardSnapshot(
-            descriptionModelID: configuration?.omlx.descriptionModelID,
+            descriptionModelID: configuration?.description.derivationID,
             promptVersion: configuration == nil ? nil : DescriptionService.promptVersion
         )
         async let segmentation = database.segmentationProgress()
@@ -1143,14 +1397,18 @@ final class AppModel: ObservableObject {
 
     // MARK: 三车道调度
 
-    /// 内容分片是轻量生产者，证据与描述是模型消费者。三者独立失败；
-    /// 每个视频的分片完成后即可进入证据队列，不必等待其余视频。
+    /// 三条车道只服务当前视频：内容分片完成后，证据链串行处理片段，
+    /// 描述可与证据链并行；当前视频全部完成前不会进入下一个视频。
 
     private func startSegmentationLane() {
         guard !isBackgroundControlBarrierActive,
               !isEvidencePaused,
               segmentationLaneFailure == nil,
               segmentationTask == nil,
+              // Do not cache once for segmentation and then again after model
+              // setup. A video enters the pipeline only when every lane needed
+              // to finish it in the same cache lifetime is available.
+              indexer != nil,
               let segmenter,
               segmentationProgress.pending > 0 else { return }
         isIndexing = true
@@ -1261,8 +1519,8 @@ final class AppModel: ObservableObject {
         scheduleDetailRefresh(matching: event.assetID)
         if event.stage == "complete" {
             // The producer publishes after the new generation is committed.
-            // Reconcile immediately so this video can enter ASR/OCR while the
-            // producer analyzes the next video.
+            // Reconcile immediately so this video can enter ASR/OCR; the
+            // producer remains gated from the next video meanwhile.
             try? await prepareIndexQueue(autoStart: true)
         }
         refreshProcessingStatusThrottled()
@@ -1359,20 +1617,28 @@ final class AppModel: ObservableObject {
         }
 
         if readDatabase != nil { try? await refreshJobs() }
+        var reconciliationSucceeded = true
         if !cancelled, error == nil {
-            try? await prepareIndexQueue(autoStart: false)
+            do {
+                try await prepareIndexQueue(autoStart: false)
+            } catch {
+                reconciliationSucceeded = false
+                segmentationLaneFailure = error.localizedDescription
+                errorMessage = "处理队列协调失败：\(error.localizedDescription)"
+            }
         }
-        if !isBackgroundControlBarrierActive,
-           !isEvidencePaused,
-           segmentationLaneFailure == nil,
-           segmentationProgress.pending > 0 {
+        let processedAny = (summary?.succeeded ?? 0) + (summary?.failed ?? 0) > 0
+        let advanced = !cancelled && error == nil && reconciliationSucceeded
+            ? await releaseCompletedCachedSource()
+            : false
+        if advanced {
+            startIndexing()
+        } else if processedAny {
+            // A lane can be idle while another lane still owns the current
+            // video. Do not spin on globally-pending jobs from later videos.
             startSegmentationLane()
-        }
-        if !isBackgroundControlBarrierActive,
-           !isEvidencePaused,
-           evidenceLaneFailure == nil,
-           indexingProgress.pending > 0 {
             startEvidenceLane()
+            startDescriptionLane()
         }
         isIndexing = segmentationTask != nil || indexTask != nil || describeTask != nil
     }
@@ -1445,22 +1711,58 @@ final class AppModel: ObservableObject {
         }
 
         // Reconcile only discovers new work. It never resets a running claim.
+        var reconciliationSucceeded = true
         if !cancelled, error == nil, indexer != nil {
-            try? await prepareIndexQueue(autoStart: false)
+            do {
+                try await prepareIndexQueue(autoStart: false)
+            } catch {
+                reconciliationSucceeded = false
+                let detail = error.localizedDescription
+                if lane == .evidence {
+                    evidenceLaneFailure = detail
+                } else {
+                    descriptionLaneFailure = detail
+                }
+                errorMessage = "处理队列协调失败：\(detail)"
+            }
         }
-        if !isBackgroundControlBarrierActive,
-           !isEvidencePaused,
-           evidenceLaneFailure == nil,
-           indexingProgress.pending > 0 {
+        let processedAny = (summary?.succeeded ?? 0) + (summary?.failed ?? 0) > 0
+        let advanced = !cancelled && error == nil && reconciliationSucceeded
+            ? await releaseCompletedCachedSource()
+            : false
+        if advanced {
+            startIndexing()
+        } else if processedAny {
+            // Refresh every consumer once because completion events are
+            // delivered asynchronously and may arrive after this lane exits.
+            // Database gating keeps these starts on the current video.
+            startSegmentationLane()
             startEvidenceLane()
-        }
-        if !isBackgroundControlBarrierActive,
-           !isDescriptionPaused,
-           descriptionLaneFailure == nil,
-           describeProgress.pending > 0 {
             startDescriptionLane()
         }
         isIndexing = segmentationTask != nil || indexTask != nil || describeTask != nil
+    }
+
+    /// The local source is retained while any lane can still work on that
+    /// video, then removed before the scheduler advances to another video.
+    @discardableResult
+    private func releaseCompletedCachedSource() async -> Bool {
+        guard let database, let sourceCache,
+              let assetID = await sourceCache.cachedAssetID() else { return false }
+        let requiresEvidence = indexer != nil
+        let requiresDescriptions = describeQueue != nil
+        do {
+            return try await sourceCache.removeIfUnused(assetID: assetID) {
+                try await !database.hasActiveProcessingWork(
+                    assetID: assetID,
+                    requiresEvidence: requiresEvidence,
+                    requiresDescriptions: requiresDescriptions
+                )
+            }
+        } catch {
+            errorMessage = "清理本地视频缓存失败：\(error.localizedDescription)"
+            return false
+        }
     }
 
     private func loadAssetDetail(for asset: MediaAssetRecord) {
@@ -1652,14 +1954,6 @@ final class AppModel: ObservableObject {
     private func present(_ error: Error) {
         errorMessage = error.localizedDescription
         statusMessage = "发生错误"
-    }
-}
-
-private enum SettingsValidationError: Error, LocalizedError {
-    case invalidValues
-
-    var errorDescription: String? {
-        "模型设置不完整，或 oMLX 地址不是有效的 http/https 地址。"
     }
 }
 

@@ -24,6 +24,160 @@ public enum MediaDatabaseDerivationError: Error, LocalizedError, Sendable {
 }
 
 extension MediaDatabase {
+    /// One asset owns all background processing lanes at a time. A running
+    /// asset remains sticky; otherwise the first path with pending work wins.
+    func activeProcessingAssetID() throws -> String? {
+        let running = try connection.prepare(
+            """
+            SELECT j.asset_id
+            FROM job j
+            LEFT JOIN media_asset a ON a.id = j.asset_id
+            WHERE j.asset_id IS NOT NULL
+              AND j.kind IN ('segment_asset', 'index_segment', 'describe_segment')
+              AND j.status = 'running'
+            ORDER BY coalesce(a.relative_path, '') COLLATE NOCASE,
+                     coalesce(a.standardized_path, '') COLLATE NOCASE,
+                     j.asset_id
+            LIMIT 1
+            """
+        )
+        if try running.step() {
+            return running.text(at: 0)
+        }
+
+        let pending = try connection.prepare(
+            """
+            SELECT a.id
+            FROM media_asset a
+            WHERE a.status = 'ready'
+              AND a.invalidated_at IS NULL
+              AND a.is_excluded = 0
+              AND EXISTS (
+                  SELECT 1 FROM job j
+                  WHERE j.asset_id = a.id
+                    AND j.kind IN ('segment_asset', 'index_segment', 'describe_segment')
+                    AND j.status = 'pending'
+              )
+            ORDER BY a.relative_path COLLATE NOCASE,
+            a.standardized_path COLLATE NOCASE,
+            a.id
+            LIMIT 1
+            """
+        )
+        guard try pending.step() else { return nil }
+        return pending.text(at: 0)
+    }
+
+    public func hasActiveProcessingWork(
+        assetID: String,
+        requiresEvidence: Bool,
+        requiresDescriptions: Bool
+    ) throws -> Bool {
+        let statement = try connection.prepare(
+            """
+            SELECT 1
+            FROM job j
+            WHERE j.asset_id = ?
+              AND j.kind IN ('segment_asset', 'index_segment', 'describe_segment')
+              AND j.status = 'running'
+            LIMIT 1
+            """
+        )
+        try statement.bind(.text(assetID), at: 1)
+        if try statement.step() { return true }
+
+        let asset = try connection.prepare(
+            """
+            SELECT status = 'ready' AND invalidated_at IS NULL AND is_excluded = 0
+            FROM media_asset
+            WHERE id = ?
+            LIMIT 1
+            """
+        )
+        try asset.bind(.text(assetID), at: 1)
+        guard try asset.step(), asset.integer(at: 0) != 0 else {
+            // An unavailable source cannot make progress. A running reader was
+            // handled above; once it exits, retaining the cache has no benefit.
+            return false
+        }
+
+        let pending = try connection.prepare(
+            """
+            SELECT 1
+            FROM job
+            WHERE asset_id = ?
+              AND kind IN ('segment_asset', 'index_segment', 'describe_segment')
+              AND status = 'pending'
+            LIMIT 1
+            """
+        )
+        try pending.bind(.text(assetID), at: 1)
+        if try pending.step() { return true }
+
+        let segmentation = try connection.prepare(
+            """
+            SELECT status
+            FROM job
+            WHERE asset_id = ? AND kind = 'segment_asset'
+            LIMIT 1
+            """
+        )
+        try segmentation.bind(.text(assetID), at: 1)
+        guard try segmentation.step(),
+              let statusText = segmentation.text(at: 0),
+              let status = JobStatus(rawValue: statusText) else {
+            return false
+        }
+        switch status {
+        case .pending, .running:
+            return true
+        case .failed, .cancelled:
+            return false
+        case .succeeded:
+            break
+        }
+        guard requiresEvidence else { return false }
+
+        // A temporarily missing downstream job means reconciliation has not
+        // finished, not that the video is complete. Failed evidence is terminal
+        // and intentionally does not require a description.
+        let incomplete = try connection.prepare(
+            """
+            SELECT 1
+            FROM segment s
+            LEFT JOIN job evidence
+              ON evidence.segment_id = s.id AND evidence.kind = 'index_segment'
+            LEFT JOIN job description
+              ON description.segment_id = s.id AND description.kind = 'describe_segment'
+            WHERE s.asset_id = ?
+              AND (
+                s.is_active = 1
+                OR EXISTS (
+                    SELECT 1 FROM derivation_run sr
+                    WHERE sr.id = s.segmentation_run_id
+                      AND sr.kind = 'segmentation' AND sr.status = 'running'
+                )
+              )
+              AND (
+                evidence.id IS NULL
+                OR evidence.status IN ('pending', 'running')
+                OR (
+                    evidence.status = 'succeeded'
+                    AND ? = 1
+                    AND (
+                        description.id IS NULL
+                        OR description.status IN ('pending', 'running')
+                    )
+                )
+              )
+            LIMIT 1
+            """
+        )
+        try incomplete.bind(.text(assetID), at: 1)
+        try incomplete.bind(.integer(requiresDescriptions ? 1 : 0), at: 2)
+        return try incomplete.step()
+    }
+
     public func reconcileIndexJobs(
         embeddingModelID: String,
         inputVersion: String,
@@ -156,22 +310,41 @@ extension MediaDatabase {
         }
     }
 
-    public func claimNextIndexJob(now: Date = Date()) throws -> JobClaim {
-        try claimNextJob(kind: .indexSegment, requiresEmbedding: false, now: now)
+    public func claimNextIndexJob(
+        restrictToAssetID: String? = nil,
+        now: Date = Date()
+    ) throws -> JobClaim {
+        try claimNextJob(
+            kind: .indexSegment,
+            requiresEmbedding: false,
+            restrictToAssetID: restrictToAssetID,
+            now: now
+        )
     }
 
     /// 描述车道的任务认领；只处理当前仍有有效向量的片段。
-    public func claimNextDescribeJob(now: Date = Date()) throws -> JobClaim {
-        try claimNextJob(kind: .describeSegment, requiresEmbedding: true, now: now)
+    public func claimNextDescribeJob(
+        restrictToAssetID: String? = nil,
+        now: Date = Date()
+    ) throws -> JobClaim {
+        try claimNextJob(
+            kind: .describeSegment,
+            requiresEmbedding: true,
+            restrictToAssetID: restrictToAssetID,
+            now: now
+        )
     }
 
     /// 供证据车道按全局队列顺序预读下一个任务，不改变任务状态，
     /// 也不认领任务或影响描述车道。
-    public func peekNextIndexJob() throws -> SegmentIndexTarget? {
+    public func peekNextIndexJob(restrictToAssetID: String? = nil) throws -> SegmentIndexTarget? {
+        guard let activeAssetID = try restrictToAssetID ?? activeProcessingAssetID() else {
+            return nil
+        }
         guard let row = try selectNextJob(
             kind: "index_segment",
             requiresEmbedding: false,
-            restrictAssetID: nil
+            restrictAssetID: activeAssetID
         ) else { return nil }
         return SegmentIndexTarget(
             job: IndexJobRecord(
@@ -207,13 +380,17 @@ extension MediaDatabase {
     private func claimNextJob(
         kind: JobKind,
         requiresEmbedding: Bool,
+        restrictToAssetID: String?,
         now: Date
     ) throws -> JobClaim {
         try connection.inTransaction {
+            guard let activeAssetID = try restrictToAssetID ?? activeProcessingAssetID() else {
+                return .idle
+            }
             guard let row = try selectNextJob(
                 kind: kind.rawValue,
                 requiresEmbedding: requiresEmbedding,
-                restrictAssetID: nil
+                restrictAssetID: activeAssetID
             ) else {
                 return .idle
             }
@@ -266,6 +443,12 @@ extension MediaDatabase {
             : ""
         let assetFilter = restrictAssetID != nil ? "AND a.id = ?" : ""
         let segmentEligibility = """
+            AND NOT EXISTS (
+                SELECT 1 FROM job segmentation_job
+                WHERE segmentation_job.asset_id = a.id
+                  AND segmentation_job.kind = 'segment_asset'
+                  AND segmentation_job.status IN ('pending', 'running')
+            )
             AND (
                 s.is_active = 1
                 OR EXISTS (

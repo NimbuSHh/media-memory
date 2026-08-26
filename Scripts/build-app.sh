@@ -5,6 +5,11 @@ script_directory="${0:A:h}"
 repository_directory="${script_directory:h}"
 developer_directory="${DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Developer}"
 cache_directory="$repository_directory/.build/PackagingCache"
+build_directory="$(/usr/bin/mktemp -d /private/tmp/media-memory-release.XXXXXX)"
+cleanup_build_directory() {
+    /bin/rm -rf "$build_directory"
+}
+trap cleanup_build_directory EXIT
 /bin/mkdir -p \
     "$cache_directory/clang" \
     "$cache_directory/modules" \
@@ -13,9 +18,14 @@ cache_directory="$repository_directory/.build/PackagingCache"
     "$cache_directory/security"
 swift_arguments=(
     --disable-sandbox
+    --scratch-path "$build_directory"
     --cache-path "$cache_directory/cache"
     --config-path "$cache_directory/config"
     --security-path "$cache_directory/security"
+    -Xswiftc -file-prefix-map
+    -Xswiftc "$repository_directory=."
+    -Xswiftc -debug-prefix-map
+    -Xswiftc "$repository_directory=."
 )
 
 cd "$repository_directory"

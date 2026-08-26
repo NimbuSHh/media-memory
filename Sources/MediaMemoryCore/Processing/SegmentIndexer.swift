@@ -37,6 +37,7 @@ public actor SegmentIndexer {
     private let database: MediaDatabase
     private let configuration: ModelConfiguration
     private let runtime: LocalModelRuntime
+    private let sourceCache: LocalSourceCache
     private let workRoot: URL
     private let inputVersion: String
 
@@ -44,11 +45,13 @@ public actor SegmentIndexer {
         database: MediaDatabase,
         configuration: ModelConfiguration,
         runtime: LocalModelRuntime,
+        sourceCache: LocalSourceCache,
         workRoot: URL
     ) {
         self.database = database
         self.configuration = configuration
         self.runtime = runtime
+        self.sourceCache = sourceCache
         self.workRoot = workRoot.standardizedFileURL
         inputVersion = Self.inputVersion(for: configuration)
     }
@@ -58,9 +61,9 @@ public actor SegmentIndexer {
             "segment-v1",
             frameSelectionVersion,
             "vision-ocr-v1",
-            configuration.omlx.asrModelID,
-            configuration.worker.forcedAlignerModelID,
-            configuration.worker.embeddingModelID
+            configuration.asr.derivationID,
+            configuration.aligner.derivationID,
+            configuration.embedding.derivationID
         ].joined(separator: "|")
         return SHA256.hash(data: Data(source.utf8))
             .map { String(format: "%02x", $0) }
@@ -71,7 +74,7 @@ public actor SegmentIndexer {
         let activated = try await database.activateAllReadySegmentations()
         if activated { await cleanupPrunedFrames() }
         try await database.reconcileIndexJobs(
-            embeddingModelID: configuration.worker.embeddingModelID,
+            embeddingModelID: configuration.embedding.derivationID,
             inputVersion: inputVersion
         )
         return try await database.indexingProgress()
@@ -100,7 +103,10 @@ public actor SegmentIndexer {
 
             laneLoop: while !Task.isCancelled {
                 let target: SegmentIndexTarget
-                switch try await database.claimNextIndexJob() {
+                let cachedAssetID = await sourceCache.cachedAssetID()
+                switch try await database.claimNextIndexJob(
+                    restrictToAssetID: cachedAssetID
+                ) {
                 case .target(let value):
                     target = value
                 case .idle:
@@ -133,17 +139,18 @@ public actor SegmentIndexer {
                     }
                     continue
                 }
-                // 当前片段进入模型阶段时，预读下一个片段（可能是下一个视频的
-                // 第一个片段）的音频与帧，让网络读取与模型计算重叠。
+                // 当前片段进入模型阶段时，只预读同一视频的下一个片段，
+                // 让本地提取与模型计算重叠，但不让后续视频抢跑。
                 await startPrefetch()
                 do {
-                    try await process(target, inputs: inputs, onEvent: onEvent)
+                    try await sourceCache.withLocalURL(for: target.asset) { [self] _ in
+                        try await process(target, inputs: inputs, onEvent: onEvent)
+                        // Keep the asset lease through downstream enqueue so a
+                        // temporarily empty job queue cannot release the source.
+                        try await database.reconcileDescribeJobs()
+                        await publish(target: target, stage: "complete", onEvent: onEvent)
+                    }
                     succeeded += 1
-                    // 证据已提交：立刻把该片段的描述任务入队，描述车道可以在
-                    // 本车道处理下一个片段的同时并行消费。
-                    try? await database.reconcileDescribeJobs()
-                    // 完成事件在描述入队之后发布，界面层可据此启动独立描述车道。
-                    await publish(target: target, stage: "complete", onEvent: onEvent)
                 } catch is CancellationError {
                     try await returnToQueue(target.job.claimToken)
                     throw CancellationError()
@@ -199,6 +206,7 @@ public actor SegmentIndexer {
 
     private struct PreparedInputs {
         let runDirectory: URL
+        let sourceURL: URL
         let audioURL: URL?
         let frames: [FrameSample]
     }
@@ -241,8 +249,8 @@ public actor SegmentIndexer {
         onEvent: EventHandler?
     ) async throws -> PreparedInputs {
         try Task.checkCancellation()
-        let sourceURL = URL(fileURLWithPath: target.asset.standardizedPath)
-        try verifySource(target.asset, at: sourceURL)
+        let sourceURL = try await sourceCache.localURL(for: target.asset)
+        try await sourceCache.validateLocalURL(sourceURL, for: target.asset)
         try await stage("audio", target: target, onEvent: onEvent)
 
         let runDirectory = workRoot
@@ -254,21 +262,28 @@ public actor SegmentIndexer {
         var audioURL: URL?
         if target.asset.audioTrackCount > 0 {
             let destination = runDirectory.appending(path: "audio.wav")
-            _ = try await extractAudio(target: target, sourceURL: sourceURL, destination: destination)
+            _ = try await extractAudio(target: target, destination: destination)
             audioURL = destination
         }
 
         let frames = try await extractFrames(
             target: target,
-            sourceURL: sourceURL,
             destination: runDirectory.appending(path: "frames", directoryHint: .isDirectory)
         )
-        return PreparedInputs(runDirectory: runDirectory, audioURL: audioURL, frames: frames)
+        return PreparedInputs(
+            runDirectory: runDirectory,
+            sourceURL: sourceURL,
+            audioURL: audioURL,
+            frames: frames
+        )
     }
 
     private func startPrefetch() async {
         guard prefetch == nil else { return }
-        guard let next = try? await database.peekNextIndexJob() else { return }
+        let cachedAssetID = await sourceCache.cachedAssetID()
+        guard let next = try? await database.peekNextIndexJob(
+            restrictToAssetID: cachedAssetID
+        ) else { return }
         let directory = workRoot
             .appending(path: "Prefetch", directoryHint: .isDirectory)
             .appending(path: next.job.id, directoryHint: .isDirectory)
@@ -290,51 +305,57 @@ public actor SegmentIndexer {
         directory: URL
     ) async throws -> PreparedInputs {
         try Task.checkCancellation()
-        let sourceURL = URL(fileURLWithPath: target.asset.standardizedPath)
-        try verifySource(target.asset, at: sourceURL)
+        let sourceURL = try await sourceCache.localURL(for: target.asset)
+        try await sourceCache.validateLocalURL(sourceURL, for: target.asset)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
 
         var audioURL: URL?
         if target.asset.audioTrackCount > 0 {
             let destination = directory.appending(path: "audio.wav")
-            _ = try await extractAudio(target: target, sourceURL: sourceURL, destination: destination)
+            _ = try await extractAudio(target: target, destination: destination)
             audioURL = destination
         }
         let frames = try await extractFrames(
             target: target,
-            sourceURL: sourceURL,
             destination: directory.appending(path: "frames", directoryHint: .isDirectory)
         )
-        return PreparedInputs(runDirectory: directory, audioURL: audioURL, frames: frames)
+        return PreparedInputs(
+            runDirectory: directory,
+            sourceURL: sourceURL,
+            audioURL: audioURL,
+            frames: frames
+        )
     }
 
     private func extractAudio(
         target: SegmentIndexTarget,
-        sourceURL: URL,
         destination: URL
     ) async throws -> URL {
         try await AsyncTimeout.run(for: .seconds(120), operationName: "提取片段音频") {
-            try await AudioSegmentExtractor.extractWAV(
-                assetURL: sourceURL,
-                startMS: target.segment.startMS,
-                endMS: target.segment.endMS,
-                destinationURL: destination
-            )
+            try await self.sourceCache.withLocalURL(for: target.asset) { sourceURL in
+                try await AudioSegmentExtractor.extractWAV(
+                    assetURL: sourceURL,
+                    startMS: target.segment.startMS,
+                    endMS: target.segment.endMS,
+                    destinationURL: destination
+                )
+            }
         }
     }
 
     private func extractFrames(
         target: SegmentIndexTarget,
-        sourceURL: URL,
         destination: URL
     ) async throws -> [FrameSample] {
         try await AsyncTimeout.run(for: .seconds(120), operationName: "提取片段画面") {
-            try await FrameExtractor.extract(
-                assetURL: sourceURL,
-                startMS: target.segment.startMS,
-                endMS: target.segment.endMS,
-                destinationDirectory: destination
-            )
+            try await self.sourceCache.withLocalURL(for: target.asset) { sourceURL in
+                try await FrameExtractor.extract(
+                    assetURL: sourceURL,
+                    startMS: target.segment.startMS,
+                    endMS: target.segment.endMS,
+                    destinationDirectory: destination
+                )
+            }
         }
     }
 
@@ -358,7 +379,7 @@ public actor SegmentIndexer {
     ) async throws {
         try Task.checkCancellation()
         defer { try? FileManager.default.removeItem(at: inputs.runDirectory) }
-        let sourceURL = URL(fileURLWithPath: target.asset.standardizedPath)
+        let sourceURL = inputs.sourceURL
 
         var transcripts: [TranscriptSentenceDraft] = []
         if let audioURL = inputs.audioURL {
@@ -437,7 +458,7 @@ public actor SegmentIndexer {
         )
 
         try Task.checkCancellation()
-        try verifySource(target.asset, at: sourceURL)
+        try await sourceCache.validateLocalURL(sourceURL, for: target.asset)
         try await stage("commit", target: target, onEvent: onEvent)
         let previousFrames = try await database.segmentFrames(segmentID: target.segment.id)
         let storedFrames = try persist(
@@ -450,9 +471,9 @@ public actor SegmentIndexer {
             ocr: ocr,
             frames: storedFrames,
             embedding: embedding,
-            asrModelID: configuration.omlx.asrModelID,
-            alignerModelID: configuration.worker.forcedAlignerModelID,
-            embeddingModelID: configuration.worker.embeddingModelID,
+            asrModelID: configuration.asr.derivationID,
+            alignerModelID: configuration.aligner.derivationID,
+            embeddingModelID: configuration.embedding.derivationID,
             runtimeVersion: Self.runtimeVersion
         )
         do {
@@ -514,12 +535,6 @@ public actor SegmentIndexer {
         )
     }
 
-    private func verifySource(_ asset: MediaAssetRecord, at url: URL) throws {
-        let snapshot = try FileFingerprint.snapshot(for: url)
-        let current = try FileFingerprint.lightFingerprint(for: url, snapshot: snapshot)
-        guard current == asset.fingerprint else { throw SegmentIndexerError.sourceChanged }
-    }
-
     private func embeddingText(
         transcripts: [TranscriptSentenceDraft],
         ocr: [OCRObservationDraft]
@@ -544,7 +559,10 @@ public actor SegmentIndexer {
             return try representatives.enumerated().map { index, frame in
                 let filename = String(format: "%02d-%012lld.jpg", index, frame.timeMS)
                 let destination = destinationDirectory.appending(path: filename)
-                try FileManager.default.copyItem(at: frame.imageURL, to: destination)
+                try FrameExtractor.writePersistentThumbnail(
+                    from: frame.imageURL,
+                    to: destination
+                )
                 return SegmentFrameDraft(
                     timeMS: frame.timeMS,
                     relativePath: "\(relativeDirectory)/\(filename)",

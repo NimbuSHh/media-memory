@@ -2,6 +2,13 @@ import Foundation
 
 public enum ApplicationPaths {
     public static func baseDirectoryURL() throws -> URL {
+        if let overridePath = ProcessInfo.processInfo.environment["MEDIA_MEMORY_DATA_ROOT"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !overridePath.isEmpty {
+            let directory = URL(fileURLWithPath: overridePath, isDirectory: true).standardizedFileURL
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            return directory
+        }
         let base = try FileManager.default.url(
             for: .applicationSupportDirectory,
             in: .userDomainMask,
@@ -68,6 +75,17 @@ public enum ApplicationPaths {
         }
     }
 
+    public static func cleanupAbandonedSourceCache(in workRoot: URL) throws {
+        try LocalSourceCache.cleanupAbandoned(in: workRoot)
+    }
+
+    public static func cleanupAbandonedDescriptionRuns(in workRoot: URL) throws {
+        let root = workRoot.standardizedFileURL
+            .appending(path: "DescriptionRuns", directoryHint: .isDirectory)
+        guard try isOrdinaryDirectory(root), !containsSymbolicLink(in: root) else { return }
+        try FileManager.default.removeItem(at: root)
+    }
+
     public static func cleanupUnreferencedFrames(
         in workRoot: URL,
         referencedRelativePaths: Set<String>
@@ -95,6 +113,33 @@ public enum ApplicationPaths {
                 }
                 guard !isReferenced, !containsSymbolicLink(in: attempt) else { continue }
                 try FileManager.default.removeItem(at: attempt)
+            }
+        }
+    }
+
+    public static func compactReferencedFrames(
+        in workRoot: URL,
+        referencedRelativePaths: Set<String>
+    ) throws {
+        let root = workRoot.standardizedFileURL
+        let resolvedRoot = root.resolvingSymlinksInPath()
+        for relativePath in referencedRelativePaths.sorted() {
+            let url = root.appending(path: relativePath).standardizedFileURL
+            let resolvedURL = url.resolvingSymlinksInPath()
+            guard url.path.hasPrefix(root.path + "/"),
+                  resolvedURL.path.hasPrefix(resolvedRoot.path + "/") else { continue }
+            do {
+                let values = try url.resourceValues(forKeys: [
+                    .isRegularFileKey,
+                    .isSymbolicLinkKey
+                ])
+                guard values.isRegularFile == true,
+                      values.isSymbolicLink != true else { continue }
+                try FrameExtractor.compactPersistentThumbnail(at: url)
+            } catch {
+                // A single corrupt legacy thumbnail must not prevent startup
+                // or block model lanes. It remains available for later repair.
+                continue
             }
         }
     }

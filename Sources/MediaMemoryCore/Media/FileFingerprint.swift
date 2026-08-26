@@ -31,6 +31,26 @@ enum FileFingerprint {
 
     static func lightFingerprint(for url: URL, snapshot: MediaFileSnapshot) throws -> String {
         var input = metadata(snapshot: snapshot)
+        input.append(try sampledBytes(for: url, snapshot: snapshot))
+        return digest(input)
+    }
+
+    /// Identifies the copied bytes without depending on filesystem timestamp
+    /// precision, which can differ between NAS and local volumes.
+    static func sampledContentFingerprint(
+        for url: URL,
+        snapshot: MediaFileSnapshot
+    ) throws -> String {
+        var input = Data("\(snapshot.fileSize)|".utf8)
+        input.append(try sampledBytes(for: url, snapshot: snapshot))
+        return digest(input)
+    }
+
+    private static func sampledBytes(
+        for url: URL,
+        snapshot: MediaFileSnapshot
+    ) throws -> Data {
+        var input = Data()
         let handle = try FileHandle(forReadingFrom: url)
         defer { try? handle.close() }
 
@@ -44,7 +64,7 @@ enum FileFingerprint {
                 input.append(suffix)
             }
         }
-        return digest(input)
+        return input
     }
 
     static func metadataFingerprint(snapshot: MediaFileSnapshot) -> String {

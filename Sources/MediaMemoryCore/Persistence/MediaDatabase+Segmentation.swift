@@ -178,8 +178,14 @@ extension MediaDatabase {
         return try segmentationProgress()
     }
 
-    public func claimNextSegmentationJob(now: Date = Date()) throws -> AssetSegmentationClaim {
+    public func claimNextSegmentationJob(
+        restrictToAssetID: String? = nil,
+        now: Date = Date()
+    ) throws -> AssetSegmentationClaim {
         try connection.inTransaction {
+            guard let activeAssetID = try restrictToAssetID ?? activeProcessingAssetID() else {
+                return .idle
+            }
             let query = try connection.prepare(
                 """
                 SELECT j.id, j.attempt_count, j.created_at,
@@ -195,10 +201,12 @@ extension MediaDatabase {
                   AND a.status = 'ready'
                   AND a.invalidated_at IS NULL
                   AND a.is_excluded = 0
+                  AND a.id = ?
                 ORDER BY a.relative_path COLLATE NOCASE
                 LIMIT 1
                 """
             )
+            try query.bind(.text(activeAssetID), at: 1)
             guard try query.step(),
                   let jobID = query.text(at: 0),
                   let asset = segmentationAsset(from: query, offset: 3) else {

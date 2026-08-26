@@ -1,10 +1,12 @@
 import Foundation
 
-public struct OMLXTranscription: Decodable, Equatable, Sendable {
+public struct ModelTranscription: Decodable, Equatable, Sendable {
     public let text: String
     public let language: String?
     public let duration: Double?
 }
+
+public typealias OMLXTranscription = ModelTranscription
 
 public struct TimedImageInput: Equatable, Sendable {
     public let timeMS: Int64
@@ -16,7 +18,7 @@ public struct TimedImageInput: Equatable, Sendable {
     }
 }
 
-public enum OMLXClientError: Error, LocalizedError, Sendable {
+public enum ModelServiceError: Error, LocalizedError, Sendable {
     case invalidEndpoint
     case invalidResponse
     case invalidModelOutput(String)
@@ -25,25 +27,24 @@ public enum OMLXClientError: Error, LocalizedError, Sendable {
     public var errorDescription: String? {
         switch self {
         case .invalidEndpoint:
-            "oMLX 服务地址无效。"
+            "模型服务请求地址无效。"
         case .invalidResponse:
-            "oMLX 返回了无效响应。"
+            "模型服务返回了无效响应。"
         case let .invalidModelOutput(message):
-            "模型返回的结构不符合描述契约：\(message)"
+            "模型返回内容不符合接口契约：\(message)"
         case let .httpStatus(status, message):
-            "oMLX 请求失败（HTTP \(status)）：\(message)"
+            "模型服务请求失败（HTTP \(status)）：\(message)"
         }
     }
 }
 
-public actor OMLXClient {
-    private let baseURL: URL
-    private let apiKey: String
+/// HTTP adapters are capability-specific and provider-neutral. Endpoint URLs
+/// are complete request URLs, so a local and a remote implementation are
+/// interchangeable when they implement the same request/response contract.
+public actor HTTPModelClient {
     private let session: URLSession
 
-    public init(baseURL: URL, apiKey: String, session: URLSession? = nil) {
-        self.baseURL = baseURL
-        self.apiKey = apiKey
+    public init(session: URLSession? = nil) {
         if let session {
             self.session = session
         } else {
@@ -55,14 +56,12 @@ public actor OMLXClient {
     }
 
     public func transcribe(
+        endpointURL: URL,
+        apiKey: String,
         audioURL: URL,
         modelID: String,
         language: String? = nil
-    ) async throws -> OMLXTranscription {
-        let endpoint = baseURL.appending(path: "audio/transcriptions")
-        guard endpoint.scheme != nil else {
-            throw OMLXClientError.invalidEndpoint
-        }
+    ) async throws -> ModelTranscription {
         let boundary = "MediaMemory-\(UUID().uuidString)"
         var body = Data()
         appendField(name: "model", value: modelID, boundary: boundary, to: &body)
@@ -80,25 +79,97 @@ public actor OMLXClient {
         )
         body.append(Data("--\(boundary)--\r\n".utf8))
 
-        var request = URLRequest(url: endpoint)
+        var request = try request(url: endpointURL, apiKey: apiKey)
         request.timeoutInterval = 300
         request.httpMethod = "POST"
-        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
         request.httpBody = body
-        let (data, response) = try await session.data(for: request)
-        try validate(response: response, data: data)
-        return try JSONDecoder().decode(OMLXTranscription.self, from: data)
+        let data = try await responseData(for: request)
+        return try JSONDecoder().decode(ModelTranscription.self, from: data)
+    }
+
+    /// Media Memory alignment HTTP contract: multipart fields `model`, `text`,
+    /// `language`, and `file`; response `{ "items": [{text,start_ms,end_ms}] }`.
+    public func align(
+        endpointURL: URL,
+        apiKey: String,
+        audioURL: URL,
+        text: String,
+        language: String,
+        modelID: String
+    ) async throws -> [AlignedToken] {
+        let boundary = "MediaMemory-\(UUID().uuidString)"
+        var body = Data()
+        appendField(name: "model", value: modelID, boundary: boundary, to: &body)
+        appendField(name: "text", value: text, boundary: boundary, to: &body)
+        appendField(name: "language", value: language, boundary: boundary, to: &body)
+        appendFile(
+            name: "file",
+            filename: audioURL.lastPathComponent,
+            mimeType: audioURL.pathExtension.lowercased() == "m4a" ? "audio/mp4" : "audio/wav",
+            data: try await Self.readFile(at: audioURL),
+            boundary: boundary,
+            to: &body
+        )
+        body.append(Data("--\(boundary)--\r\n".utf8))
+
+        var request = try request(url: endpointURL, apiKey: apiKey)
+        request.timeoutInterval = 300
+        request.httpMethod = "POST"
+        request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+        request.httpBody = body
+        let data = try await responseData(for: request)
+        return try JSONDecoder().decode(AlignmentResponse.self, from: data).items
+    }
+
+    /// Media Memory multimodal embedding HTTP contract. Images are ordered data
+    /// URLs; the service returns one vector plus optional dimension and norm.
+    public func embed(
+        endpointURL: URL,
+        apiKey: String,
+        text: String,
+        imageURLs: [URL],
+        instruction: String,
+        modelID: String
+    ) async throws -> EmbeddingVector {
+        var images: [String] = []
+        for imageURL in imageURLs {
+            try Task.checkCancellation()
+            let data = try await Self.readFile(at: imageURL)
+            let mimeType = imageURL.pathExtension.lowercased() == "png" ? "image/png" : "image/jpeg"
+            images.append("data:\(mimeType);base64,\(data.base64EncodedString())")
+        }
+        let payload = EmbeddingRequest(
+            model: modelID,
+            input: .init(text: text, images: images, instruction: instruction)
+        )
+        var request = try request(url: endpointURL, apiKey: apiKey)
+        request.timeoutInterval = 300
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(payload)
+        let data = try await responseData(for: request)
+        let result = try JSONDecoder().decode(EmbeddingResponse.self, from: data)
+        let dimension = result.dimension ?? result.vector.count
+        guard !result.vector.isEmpty,
+              dimension == result.vector.count,
+              result.vector.allSatisfy(\.isFinite) else {
+            throw ModelServiceError.invalidModelOutput("向量为空、维度不匹配或包含非有限值")
+        }
+        let norm = result.norm ?? sqrt(result.vector.reduce(0) { $0 + Double($1 * $1) })
+        guard norm.isFinite, norm > 0 else {
+            throw ModelServiceError.invalidModelOutput("向量范数无效")
+        }
+        return EmbeddingVector(values: result.vector, norm: norm)
     }
 
     public func describeSegment(
+        endpointURL: URL,
+        apiKey: String,
         images: [TimedImageInput],
         evidenceText: String,
         modelID: String
     ) async throws -> SegmentDescription {
-        let endpoint = baseURL.appending(path: "chat/completions")
-        guard endpoint.scheme != nil else { throw OMLXClientError.invalidEndpoint }
-
         var content: [[String: Any]] = [[
             "type": "text",
             "text": """
@@ -106,16 +177,14 @@ public actor OMLXClient {
             你没有音频输入：禁止描述、推测或虚构任何声音、语音或音乐内容。
             ASR/OCR 证据如下（语音与画面文字以证据为准，描述中不要罗列文字清单）：
             \(evidenceText)
-            summary 组织这个片段的整体叙述，可以引用证据中的信息；
-            visible_details 逐条描述画面中可观察的事实（包括证据未覆盖的画面文字）；
-            抽帧不能证明连续动作；无法从画面与证据确认的内容写入 uncertainty。
+            只输出符合约定 schema 的 JSON。summary 组织片段整体叙述；
+            visible_details 逐条描述可观察事实；无法确认的内容写入 uncertainty。
             """
         ]]
         for image in images {
             try Task.checkCancellation()
             let data = try await Self.readFile(at: image.url)
-            let mimeType = image.url.pathExtension.lowercased() == "png"
-                ? "image/png" : "image/jpeg"
+            let mimeType = image.url.pathExtension.lowercased() == "png" ? "image/png" : "image/jpeg"
             content.append([
                 "type": "text",
                 "text": String(format: "源视频时间 %.3f 秒：", Double(image.timeMS) / 1_000)
@@ -143,16 +212,14 @@ public actor OMLXClient {
                 [
                     "role": "system",
                     "content": """
-                    你是视频片段的视觉描述器，用中文输出。你只能依据给定的关键帧与
-                    ASR/OCR 证据描述可观察的事实。不要猜测人物身份、关系、地点、
-                    意图或情绪；不要输出任何语音或声音内容。
+                    你是视频片段的视觉描述器，只能依据给定关键帧与 ASR/OCR 证据
+                    描述可观察事实。不要猜测身份、关系、地点、意图、情绪或声音。
                     """
                 ],
                 ["role": "user", "content": content]
             ],
             "temperature": 0,
             "max_tokens": 800,
-            "chat_template_kwargs": ["enable_thinking": false],
             "response_format": [
                 "type": "json_schema",
                 "json_schema": [
@@ -162,38 +229,62 @@ public actor OMLXClient {
                 ]
             ]
         ]
-        let body = try JSONSerialization.data(withJSONObject: payload)
-        var request = URLRequest(url: endpoint)
+        var request = try request(url: endpointURL, apiKey: apiKey)
         request.timeoutInterval = 600
         request.httpMethod = "POST"
-        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = body
-        let (data, response) = try await session.data(for: request)
-        try validate(response: response, data: data)
+        request.httpBody = try JSONSerialization.data(withJSONObject: payload)
+        let data = try await responseData(for: request)
 
         let completion = try JSONDecoder().decode(ChatCompletionResponse.self, from: data)
-        guard let contentText = completion.choices.first?.message.content,
-              let contentData = contentText.data(using: .utf8) else {
-            throw OMLXClientError.invalidModelOutput("响应中没有 JSON 内容")
+        guard let contentText = completion.choices.first?.message.content else {
+            throw ModelServiceError.invalidModelOutput("响应中没有文本内容")
         }
-        do {
-            let decoder = JSONDecoder()
-            decoder.keyDecodingStrategy = .convertFromSnakeCase
-            return try decoder.decode(SegmentDescription.self, from: contentData)
-        } catch {
-            throw OMLXClientError.invalidModelOutput(error.localizedDescription)
-        }
+        return try decodeDescription(from: contentText)
     }
 
-    private func validate(response: URLResponse, data: Data) throws {
+    private func request(url: URL, apiKey: String) throws -> URLRequest {
+        guard ["http", "https"].contains(url.scheme?.lowercased() ?? ""), url.host != nil else {
+            throw ModelServiceError.invalidEndpoint
+        }
+        var request = URLRequest(url: url)
+        let trimmed = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty {
+            request.setValue("Bearer \(trimmed)", forHTTPHeaderField: "Authorization")
+        }
+        return request
+    }
+
+    private func responseData(for request: URLRequest) async throws -> Data {
+        let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse else {
-            throw OMLXClientError.invalidResponse
+            throw ModelServiceError.invalidResponse
         }
         guard (200..<300).contains(http.statusCode) else {
             let message = String(data: data.prefix(1_000), encoding: .utf8) ?? "无响应正文"
-            throw OMLXClientError.httpStatus(http.statusCode, message)
+            throw ModelServiceError.httpStatus(http.statusCode, message)
         }
+        return data
+    }
+
+    private func decodeDescription(from content: String) throws -> SegmentDescription {
+        let candidates = [content, Self.extractJSONObject(from: content)].compactMap { $0 }
+        for candidate in candidates {
+            guard let data = candidate.data(using: .utf8) else { continue }
+            let decoder = JSONDecoder()
+            decoder.keyDecodingStrategy = .convertFromSnakeCase
+            if let value = try? decoder.decode(SegmentDescription.self, from: data) {
+                return value
+            }
+        }
+        throw ModelServiceError.invalidModelOutput("无法解析结构化描述 JSON")
+    }
+
+    private nonisolated static func extractJSONObject(from text: String) -> String? {
+        guard let start = text.firstIndex(of: "{"), let end = text.lastIndex(of: "}"), start <= end else {
+            return nil
+        }
+        return String(text[start...end])
     }
 
     private nonisolated static func readFile(at url: URL) async throws -> Data {
@@ -228,16 +319,29 @@ public actor OMLXClient {
         to data: inout Data
     ) {
         data.append(Data("--\(boundary)\r\n".utf8))
-        data.append(
-            Data(
-                "Content-Disposition: form-data; name=\"\(name)\"; filename=\"\(filename)\"\r\n"
-                    .utf8
-            )
-        )
+        data.append(Data("Content-Disposition: form-data; name=\"\(name)\"; filename=\"\(filename)\"\r\n".utf8))
         data.append(Data("Content-Type: \(mimeType)\r\n\r\n".utf8))
         data.append(fileData)
         data.append(Data("\r\n".utf8))
     }
+}
+
+private struct AlignmentResponse: Decodable { let items: [AlignedToken] }
+
+private struct EmbeddingRequest: Encodable {
+    struct Input: Encodable {
+        let text: String
+        let images: [String]
+        let instruction: String
+    }
+    let model: String
+    let input: Input
+}
+
+private struct EmbeddingResponse: Decodable {
+    let dimension: Int?
+    let vector: [Float]
+    let norm: Double?
 }
 
 private struct ChatCompletionResponse: Decodable {
@@ -245,6 +349,47 @@ private struct ChatCompletionResponse: Decodable {
         struct Message: Decodable { let content: String? }
         let message: Message
     }
-
     let choices: [Choice]
+}
+
+/// V0 source-compatibility wrapper. Product code uses full capability URLs via
+/// `HTTPModelClient`; this type no longer implies that oMLX is required.
+public actor OMLXClient {
+    private let baseURL: URL
+    private let apiKey: String
+    private let client: HTTPModelClient
+
+    public init(baseURL: URL, apiKey: String, session: URLSession? = nil) {
+        self.baseURL = baseURL
+        self.apiKey = apiKey
+        client = HTTPModelClient(session: session)
+    }
+
+    public func transcribe(
+        audioURL: URL,
+        modelID: String,
+        language: String? = nil
+    ) async throws -> ModelTranscription {
+        try await client.transcribe(
+            endpointURL: baseURL.appending(path: "audio/transcriptions"),
+            apiKey: apiKey,
+            audioURL: audioURL,
+            modelID: modelID,
+            language: language
+        )
+    }
+
+    public func describeSegment(
+        images: [TimedImageInput],
+        evidenceText: String,
+        modelID: String
+    ) async throws -> SegmentDescription {
+        try await client.describeSegment(
+            endpointURL: baseURL.appending(path: "chat/completions"),
+            apiKey: apiKey,
+            images: images,
+            evidenceText: evidenceText,
+            modelID: modelID
+        )
+    }
 }

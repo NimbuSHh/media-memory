@@ -23,10 +23,12 @@ final class ModelIntegrationTests: XCTestCase {
             endMS: 6_000,
             destinationURL: audio
         )
-        let client = OMLXClient(baseURL: configuration.omlx.baseURL, apiKey: apiKey)
+        let client = HTTPModelClient()
         let transcription = try await client.transcribe(
+            endpointURL: try XCTUnwrap(configuration.asr.endpointURL),
+            apiKey: apiKey,
             audioURL: audio,
-            modelID: configuration.omlx.asrModelID
+            modelID: configuration.asr.modelID
         )
         XCTAssertFalse(transcription.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
 
@@ -85,13 +87,15 @@ final class ModelIntegrationTests: XCTestCase {
         try FileManager.default.createDirectory(at: workRoot, withIntermediateDirectories: true)
         let runtime = try LocalModelRuntime(
             configuration: configuration,
-            apiKey: apiKey,
+            credentials: ModelCredentials(asr: apiKey, description: apiKey),
             workRoot: workRoot
         )
+        let sourceCache = LocalSourceCache(workRoot: workRoot, minimumFreeBytes: 0)
         let indexer = SegmentIndexer(
             database: database,
             configuration: configuration,
             runtime: runtime,
+            sourceCache: sourceCache,
             workRoot: workRoot
         )
         let summary = try await indexer.runUntilIdle()
@@ -102,7 +106,7 @@ final class ModelIntegrationTests: XCTestCase {
         XCTAssertEqual(progress.succeeded, progress.total)
 
         let embeddings = try await database.storedEmbeddings(
-            modelID: configuration.worker.embeddingModelID,
+            modelID: configuration.embedding.derivationID,
             inputVersion: SegmentIndexer.inputVersion(for: configuration)
         )
         XCTAssertEqual(embeddings.count, progress.total)
@@ -126,6 +130,7 @@ final class ModelIntegrationTests: XCTestCase {
             database: database,
             configuration: configuration,
             runtime: runtime,
+            sourceCache: sourceCache,
             workRoot: workRoot
         )
         let described = try await descriptions.description(segmentID: result.segment.id)

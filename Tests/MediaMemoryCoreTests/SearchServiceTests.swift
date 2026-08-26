@@ -220,7 +220,7 @@ private final class SearchFixture: @unchecked Sendable {
         )
         let inputVersion = SegmentIndexer.inputVersion(for: configuration)
         try await database.reconcileIndexJobs(
-            embeddingModelID: configuration.worker.embeddingModelID,
+            embeddingModelID: configuration.embedding.derivationID,
             inputVersion: inputVersion
         )
         guard case .target(let target) = try await database.claimNextIndexJob() else {
@@ -262,9 +262,9 @@ private final class SearchFixture: @unchecked Sendable {
                 ],
                 frames: [],
                 embedding: EmbeddingVector(values: [1, 0], norm: 1),
-                asrModelID: configuration.omlx.asrModelID,
-                alignerModelID: configuration.worker.forcedAlignerModelID,
-                embeddingModelID: configuration.worker.embeddingModelID,
+                asrModelID: configuration.asr.derivationID,
+                alignerModelID: configuration.aligner.derivationID,
+                embeddingModelID: configuration.embedding.derivationID,
                 runtimeVersion: "test"
             ),
             inputVersion: inputVersion
@@ -286,7 +286,7 @@ private final class SearchFixture: @unchecked Sendable {
             segmentID: segmentID,
             sourceFingerprint: "stable-fingerprint",
             expectedInputRevision: revision,
-            modelID: configuration.omlx.descriptionModelID,
+            modelID: configuration.description.derivationID,
             runtimeVersion: "test",
             promptVersion: "test-prompt",
             inputVersion: "test-input",
@@ -319,9 +319,9 @@ private final class SearchFixture: @unchecked Sendable {
                 ocr: [],
                 frames: [],
                 embedding: EmbeddingVector(values: [0, 1], norm: 1),
-                asrModelID: configuration.omlx.asrModelID,
-                alignerModelID: configuration.worker.forcedAlignerModelID,
-                embeddingModelID: configuration.worker.embeddingModelID,
+                asrModelID: configuration.asr.derivationID,
+                alignerModelID: configuration.aligner.derivationID,
+                embeddingModelID: configuration.embedding.derivationID,
                 runtimeVersion: "test"
             ),
             inputVersion: SegmentIndexer.inputVersion(for: configuration)

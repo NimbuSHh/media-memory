@@ -9,7 +9,7 @@
     <key>CFBundleExecutable</key>
     <string>MediaMemory</string>
     <key>CFBundleIdentifier</key>
-    <string>local.mediamemory.app</string>
+    <string>io.github.nimbushh.media-memory</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>

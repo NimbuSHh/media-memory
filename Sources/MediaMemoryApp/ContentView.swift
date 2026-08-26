@@ -1358,41 +1358,66 @@ private struct ModelSettingsView: View {
     var body: some View {
         VStack(spacing: 0) {
             Form {
-                Section("oMLX") {
-                    TextField("服务地址", text: $model.settingsDraft.baseURL)
-                    if usesInsecureRemoteHTTP {
-                        Label(
-                            "非本机 HTTP 会明文传输片段音频、代表帧、文字证据和 API key；请改用 HTTPS。",
-                            systemImage: "exclamationmark.triangle.fill"
-                        )
+                Section("连接方式") {
+                    Text("Media Memory 只要求接口兼容，不限制服务商。URL 可以指向本机或远程服务；涉及个人媒体时建议优先使用本机服务。")
                         .font(.caption)
-                        .foregroundStyle(.orange)
-                    }
+                        .foregroundStyle(.secondary)
                     if model.isSettingsLoading {
                         HStack {
                             ProgressView().controlSize(.small)
-                            Text("正在从钥匙串读取 API key…")
+                            Text("正在从钥匙串读取模型密钥…")
                                 .foregroundStyle(.secondary)
                         }
-                    } else {
-                        SecureField("项目 API key", text: $model.settingsDraft.apiKey)
                     }
-                    Text("API key 只保存在 macOS 钥匙串，不会写入项目或模型配置。")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
                 }
-                Section("模型") {
-                    TextField("语音识别", text: $model.settingsDraft.asrModelID)
-                    TextField("句子时间定位", text: $model.settingsDraft.alignerModelID)
-                    TextField("多模态向量", text: $model.settingsDraft.embeddingModelID)
-                    TextField("按需描述", text: $model.settingsDraft.descriptionModelID)
+
+                ModelEndpointEditor(
+                    role: .asr,
+                    draft: $model.settingsDraft.asr,
+                    testState: model.modelTestState(for: .asr),
+                    isAnyTestRunning: model.isTestingModels,
+                    supportsLocalWorker: false,
+                    testAction: { model.testModel(.asr) }
+                )
+                ModelEndpointEditor(
+                    role: .aligner,
+                    draft: $model.settingsDraft.aligner,
+                    testState: model.modelTestState(for: .aligner),
+                    isAnyTestRunning: model.isTestingModels,
+                    supportsLocalWorker: true,
+                    testAction: { model.testModel(.aligner) }
+                )
+                ModelEndpointEditor(
+                    role: .embedding,
+                    draft: $model.settingsDraft.embedding,
+                    testState: model.modelTestState(for: .embedding),
+                    isAnyTestRunning: model.isTestingModels,
+                    supportsLocalWorker: true,
+                    testAction: { model.testModel(.embedding) }
+                )
+                ModelEndpointEditor(
+                    role: .description,
+                    draft: $model.settingsDraft.description,
+                    testState: model.modelTestState(for: .description),
+                    isAnyTestRunning: model.isTestingModels,
+                    supportsLocalWorker: false,
+                    testAction: { model.testModel(.description) }
+                )
+
+                Section {
                     Text("更换 ASR、对齐或向量模型后，受影响的片段会自动重新建库；旧模型不会作为备用链路保留。")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
-                DisclosureGroup("高级路径", isExpanded: $showAdvanced) {
-                    TextField("Worker 启动器", text: $model.settingsDraft.pythonLauncherPath)
-                    TextField("oMLX 模型目录", text: $model.settingsDraft.modelRootPath)
+
+                if usesLocalWorker {
+                    DisclosureGroup("内置本地 Worker", isExpanded: $showAdvanced) {
+                        TextField("Python 启动器", text: $model.settingsDraft.pythonLauncherPath)
+                        TextField("本地模型目录", text: $model.settingsDraft.modelRootPath)
+                        Text("这是默认本地适配器，不是服务商要求；对齐和向量也可以切换为 HTTP 服务。")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
                 }
             }
             .formStyle(.grouped)
@@ -1405,23 +1430,143 @@ private struct ModelSettingsView: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
+                Button("全部测试", action: model.testAllModels)
+                    .disabled(model.isSettingsLoading || model.isSavingSettings || model.isTestingModels)
                 Spacer()
                 Button("取消", action: model.dismissSettings)
                     .keyboardShortcut(.cancelAction)
                     .disabled(model.isSavingSettings)
                 Button("保存", action: model.saveSettings)
                     .keyboardShortcut(.defaultAction)
-                    .disabled(model.isSettingsLoading || model.isSavingSettings)
+                    .disabled(
+                        model.isSettingsLoading
+                            || model.isSavingSettings
+                            || model.isTestingModels
+                    )
             }
             .padding()
         }
-        .frame(width: 680, height: 570)
+        .frame(width: 720, height: 760)
+    }
+
+    private var usesLocalWorker: Bool {
+        model.settingsDraft.aligner.transport == .localWorker
+            || model.settingsDraft.embedding.transport == .localWorker
+    }
+}
+
+private struct ModelEndpointEditor: View {
+    let role: ModelRole
+    @Binding var draft: ModelEndpointDraft
+    let testState: ModelTestState
+    let isAnyTestRunning: Bool
+    let supportsLocalWorker: Bool
+    let testAction: () -> Void
+
+    var body: some View {
+        Section {
+            HStack {
+                testStatus
+                Spacer()
+                Button("测试", action: testAction)
+                    .disabled(isAnyTestRunning || testState.phase == .testing)
+            }
+
+            if supportsLocalWorker {
+                Picker("接口", selection: $draft.transport) {
+                    Text("HTTP 服务").tag(httpTransport)
+                    Text("内置本地 Worker").tag(ModelTransport.localWorker)
+                }
+                .pickerStyle(.segmented)
+            }
+
+            if draft.transport.requiresEndpoint {
+                TextField("完整请求 URL", text: $draft.endpointURL)
+                    .textContentType(.URL)
+                if usesInsecureRemoteHTTP {
+                    Label(
+                        "非本机 HTTP 会明文传输测试数据、媒体证据和 API key；请改用 HTTPS。",
+                        systemImage: "exclamationmark.triangle.fill"
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                }
+            }
+            TextField("模型名称", text: $draft.modelID)
+            if draft.transport.requiresEndpoint {
+                SecureField("API key（无鉴权服务可留空）", text: $draft.apiKey)
+                Text("密钥只保存在 macOS 钥匙串；测试使用应用生成的音频和图片，不读取媒体库。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            if testState.phase == .failed {
+                Text(testState.message)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .textSelection(.enabled)
+            } else if testState.phase == .passed {
+                Text(testState.message)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        } header: {
+            Text(role.displayName)
+        } footer: {
+            Text(contractDescription)
+        }
+    }
+
+    @ViewBuilder
+    private var testStatus: some View {
+        switch testState.phase {
+        case .untested:
+            Label("未测试", systemImage: "circle.dashed")
+                .foregroundStyle(.secondary)
+        case .testing:
+            ProgressView()
+                .controlSize(.small)
+            Text("测试中…")
+                .foregroundStyle(.secondary)
+        case .passed:
+            Label("可用", systemImage: "checkmark.circle.fill")
+                .foregroundStyle(.green)
+        case .failed:
+            Label("失败", systemImage: "xmark.circle.fill")
+                .foregroundStyle(.red)
+        }
+    }
+
+    private var httpTransport: ModelTransport {
+        switch role {
+        case .asr: .openAITranscription
+        case .aligner: .mediaMemoryAlignment
+        case .embedding: .mediaMemoryEmbedding
+        case .description: .openAIChatCompletion
+        }
+    }
+
+    private var contractDescription: String {
+        switch role {
+        case .asr: "OpenAI 兼容 audio/transcriptions 请求。"
+        case .aligner: "HTTP 模式使用 Media Memory alignment 契约。"
+        case .embedding: "HTTP 模式使用 Media Memory 多模态 embedding 契约。"
+        case .description: "OpenAI 兼容 chat/completions 多模态请求。"
+        }
     }
 
     private var usesInsecureRemoteHTTP: Bool {
-        guard let url = URL(string: model.settingsDraft.baseURL),
+        guard draft.transport.requiresEndpoint,
+              let url = URL(string: draft.endpointURL),
               url.scheme?.lowercased() == "http",
               let host = url.host?.lowercased() else { return false }
-        return host != "localhost" && host != "::1" && !host.hasPrefix("127.")
+        if host == "localhost" || host == "::1" { return false }
+        let octets = host.split(separator: ".", omittingEmptySubsequences: false)
+        let isIPv4Loopback = octets.count == 4
+            && octets.first == "127"
+            && octets.allSatisfy { octet in
+                guard let value = Int(octet) else { return false }
+                return (0...255).contains(value)
+            }
+        return !isIPv4Loopback
     }
 }

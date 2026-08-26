@@ -1,0 +1,24 @@
+cask "media-memory" do
+  version "0.1.0"
+  sha256 "REPLACE_WITH_RELEASE_SHA256"
+
+  url "https://github.com/NimbuSHh/media-memory/releases/download/v#{version}/Media-Memory-#{version}-arm64.dmg"
+  name "Media Memory"
+  desc "Local-first evidence-based video search for macOS"
+  homepage "https://github.com/NimbuSHh/media-memory"
+
+  depends_on arch: :arm64
+  depends_on macos: ">= :sequoia"
+
+  app "Media Memory.app"
+
+  caveats <<~EOS
+    Media Memory uses an ad-hoc signature and is not notarized by Apple. On
+    first launch, macOS may require approval in System Settings > Privacy & Security.
+  EOS
+
+  zap trash: [
+    "~/Library/Application Support/MediaMemory",
+    "~/Library/Preferences/io.github.nimbushh.media-memory.plist",
+  ]
+end

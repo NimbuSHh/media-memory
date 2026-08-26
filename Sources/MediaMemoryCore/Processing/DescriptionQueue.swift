@@ -8,10 +8,16 @@ public actor DescriptionQueue {
 
     private let database: MediaDatabase
     private let descriptionService: DescriptionService
+    private let sourceCache: LocalSourceCache
 
-    public init(database: MediaDatabase, descriptionService: DescriptionService) {
+    public init(
+        database: MediaDatabase,
+        descriptionService: DescriptionService,
+        sourceCache: LocalSourceCache
+    ) {
         self.database = database
         self.descriptionService = descriptionService
+        self.sourceCache = sourceCache
     }
 
     public func prepareQueue() async throws -> IndexingProgress {
@@ -40,7 +46,10 @@ public actor DescriptionQueue {
         var failed = 0
         laneLoop: while !Task.isCancelled {
             let target: SegmentIndexTarget
-            switch try await database.claimNextDescribeJob() {
+            let cachedAssetID = await sourceCache.cachedAssetID()
+            switch try await database.claimNextDescribeJob(
+                restrictToAssetID: cachedAssetID
+            ) {
             case .target(let value):
                 target = value
             case .idle:
