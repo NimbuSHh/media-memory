@@ -129,3 +129,13 @@ GitHub Release 和 tag 不覆盖、不复用。若发布产物有问题：
 - 最终 DMG 可挂载并通过映像校验，包含 App、Applications 链接、许可证和安装说明，SHA-256 文件校验通过；
 - 最终 DMG 扫描未发现私钥、`.p12`、数据库、个人绝对路径或模型权重；
 - 旧配置鉴权确认、无鉴权模型零 Keychain 访问、旧 ACL 显式替换与失败重试、媒体权限惰性解析和删除不确定性均有回归覆盖；首次从 ad-hoc 版本现场升级时仍按 Release notes 处理 Gatekeeper、Keychain 或媒体根的系统确认。
+
+## 0.1.3 验收记录（2026-08-28）
+
+- 默认测试：126 项，3 项按显式开关跳过，0 失败；显式真实模型测试 2 项通过（ASR/对齐/OCR/向量冒烟 11.5 秒，建库/搜索/描述/缓存闭环 56.8 秒，本地 oMLX 在线）；10,000 向量排序的显式性能测试通过；
+- 连续 build 4/5 均由 `Media Memory Release Signing` 签名，公开证书 SHA-256 为 `c90b71af651fafe33f62510ca3d163065273f43266df9780e59d79f30ac40411`（与 0.1.2 基线一致），Authority 与完整 designated requirement 一致；
+- 最终 arm64 App 为 `0.1.3 (4)`，Bundle ID 为 `io.github.nimbushh.media-memory`，`codesign --verify --deep --strict` 通过；
+- 最终 DMG 可挂载并通过映像校验，包含 App、Applications 链接、许可证和安装说明，SHA-256 文件校验生成；
+- 最终 DMG 扫描未发现个人绝对路径、私钥/`.p12`、数据库、测试视频、模型权重或 Bearer 密钥模式；
+- 实机冒烟：0.1.2 旧实例优雅退出后启动 0.1.3 构建副本，主窗口正常渲染；发布者真实数据库（38 视频 / 165 活动片段）首次启动即完成 schema v8→v9 原地迁移，数据完整保留。完整 GUI 人工走查未在本轮重做，行为回归由 126 项自动化测试（含 17 项新增）覆盖；
+- 本版变更：源不可用断路停车（D-019）、时长探测漂移旁路代际修正与段 ID 代际化（D-020，schema v9）、描述缓存逐行容错与证据过期标识（D-021）、库操作屏障修复，以及侧栏按根路径统计；升级说明见 `Packaging/release-notes-v0.1.3.md`。
