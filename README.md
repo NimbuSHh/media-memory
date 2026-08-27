@@ -33,17 +33,15 @@ flowchart LR
 
 这是没有 Apple 公证的个人开源应用。首次打开若被 macOS 拦截，请进入“系统设置 → 隐私与安全”，在 Media Memory 的安全提示下选择“仍要打开”。DMG 同时提供 SHA-256 校验文件。
 
+`v0.1.2` 起 Release 内的 App 使用固定的免费自签名身份。它能让连续版本保持同一代码身份，但不等同于 Apple Developer ID，首次下载仍需手动放行。从 `v0.1.1` 的 ad-hoc 签名升级时，旧配置会先要求你在模型设置中确认鉴权方式，不会在启动时读取不确定的旧 key；确认并保存前，模型建库和语义检索暂停，本地浏览与字面搜索仍可用。媒体书签只在扫描、处理或播放时解析。macOS 仍可能在这些显式操作中要求一次钥匙串或媒体目录授权。
+
 ### Homebrew
 
-```bash
-brew install --cask NimbuSHh/tap/media-memory
-```
-
-Homebrew 安装的也是同一份 GitHub Release DMG，首次打开可能仍需在“隐私与安全”中放行。
+公开 Homebrew Tap 尚未配置；当前请使用 GitHub Release DMG。Release 会附带生成后的 Cask 文件供后续建立 Tap 时审计，但现在不要使用尚不存在的 `NimbuSHh/tap/media-memory` 安装命令。
 
 ## 配置模型
 
-Media Memory 不绑定模型供应商，也不要求服务一定在本机。每项能力分别配置请求 URL、模型名称和 API key；无鉴权服务可留空 key。
+Media Memory 不绑定模型供应商，也不要求服务一定在本机。每项能力分别配置请求 URL、模型名称和鉴权方式；只有选择 Bearer 鉴权时才读取或保存该能力的 API key，本机默认服务完全不访问钥匙串。
 
 | 能力 | HTTP 接口 |
 | --- | --- |
@@ -75,6 +73,8 @@ Media Memory 不绑定模型供应商，也不要求服务一定在本机。每�
 open ".build/Media Memory.app"
 ```
 
+正式包默认要求本机钥匙串中存在 `Media Memory Release Signing` 身份。仅做本地开发时，可显式设置 `MEDIA_MEMORY_SIGNING_IDENTITY=-` 生成不可发布的 ad-hoc 构建；私钥和 `.p12` 永远不进入仓库或产物。
+
 ```bash
 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcrun swift test
 ```
@@ -83,7 +83,7 @@ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcrun swift test
 
 ## 发布边界
 
-- DMG 使用临时签名，未加入 Apple Developer Program、未做 Developer ID 签名或 Apple 公证；
+- DMG 内的 App 使用项目发布者本机持有的长期自签名身份，未加入 Apple Developer Program、未做 Developer ID 签名或 Apple 公证；
 - 仓库和 DMG 不分发模型服务、Python/MLX 运行时或模型权重；
 - 内置本地 Worker 是默认适配器，不是产品对 oMLX 的强制依赖；
 - 不包含统计、遥测、崩溃上报、云端账号或自动更新。

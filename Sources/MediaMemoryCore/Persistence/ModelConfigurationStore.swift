@@ -3,6 +3,7 @@ import Foundation
 public struct StartupModelConfiguration: Sendable {
     public let configuration: ModelConfiguration
     public let canAdoptLegacyModelIdentities: Bool
+    public let authenticationMigrationRoles: Set<ModelRole>
 }
 
 public enum ModelConfigurationStore {
@@ -22,7 +23,8 @@ public enum ModelConfigurationStore {
             // allowing adoption is also a harmless no-op.
             return StartupModelConfiguration(
                 configuration: try ModelConfiguration.loadDefault(),
-                canAdoptLegacyModelIdentities: true
+                canAdoptLegacyModelIdentities: true,
+                authenticationMigrationRoles: []
             )
         }
         return try loadForStartup(from: url)
@@ -35,9 +37,15 @@ public enum ModelConfigurationStore {
         let sourceSchemaVersion = dictionary?["schemaVersion"] as? Int ?? 1
         let configuration = try JSONDecoder().decode(ModelConfiguration.self, from: data)
         try configuration.validate()
+        let authenticationMigrationRoles = sourceSchemaVersion < 3
+            ? Set(ModelRole.allCases.filter {
+                configuration.endpoint(for: $0).transport.requiresEndpoint
+            })
+            : []
         return StartupModelConfiguration(
             configuration: configuration,
-            canAdoptLegacyModelIdentities: sourceSchemaVersion < 2
+            canAdoptLegacyModelIdentities: sourceSchemaVersion < 2,
+            authenticationMigrationRoles: authenticationMigrationRoles
         )
     }
 

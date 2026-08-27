@@ -35,6 +35,7 @@ public enum LocalSourceCacheError: Error, LocalizedError, Sendable {
 /// jobs; AppModel releases the entry only after all jobs for that asset finish.
 public actor LocalSourceCache {
     public typealias AvailableCapacity = @Sendable (URL) throws -> Int64
+    public typealias AuthorizeSource = @Sendable (MediaAssetRecord) async throws -> Void
 
     public static let defaultMinimumFreeBytes: Int64 = 10 * 1_024 * 1_024 * 1_024
     public static let defaultMaximumSourceBytes: Int64 = 100 * 1_024 * 1_024 * 1_024
@@ -56,6 +57,7 @@ public actor LocalSourceCache {
     private let minimumFreeBytes: Int64
     private let maximumSourceBytes: Int64
     private let availableCapacity: AvailableCapacity
+    private let authorizeSource: AuthorizeSource
     private let operationGate = AsyncOperationGate()
     private var entry: Entry?
     private var activeLeaseCount = 0
@@ -65,13 +67,15 @@ public actor LocalSourceCache {
         workRoot: URL,
         minimumFreeBytes: Int64 = LocalSourceCache.defaultMinimumFreeBytes,
         maximumSourceBytes: Int64 = LocalSourceCache.defaultMaximumSourceBytes,
-        availableCapacity: AvailableCapacity? = nil
+        availableCapacity: AvailableCapacity? = nil,
+        authorizeSource: @escaping AuthorizeSource = { _ in }
     ) {
         root = workRoot.standardizedFileURL
             .appending(path: "SourceCache", directoryHint: .isDirectory)
         self.minimumFreeBytes = max(0, minimumFreeBytes)
         self.maximumSourceBytes = max(1, maximumSourceBytes)
         self.availableCapacity = availableCapacity ?? LocalSourceCache.volumeAvailableCapacity
+        self.authorizeSource = authorizeSource
     }
 
     public func localURL(for asset: MediaAssetRecord) async throws -> URL {
@@ -165,6 +169,10 @@ public actor LocalSourceCache {
         try removeAllFiles()
         entry = nil
 
+        // Resolving a security-scoped bookmark may wake an offline NAS. Do it
+        // only when a processing lane actually needs to materialize this source.
+        try await authorizeSource(asset)
+        try Task.checkCancellation()
         let sourceURL = URL(fileURLWithPath: asset.standardizedPath).standardizedFileURL
         let before = try FileFingerprint.snapshot(for: sourceURL)
         let beforeFingerprint = try FileFingerprint.lightFingerprint(for: sourceURL, snapshot: before)

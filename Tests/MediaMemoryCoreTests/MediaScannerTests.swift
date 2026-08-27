@@ -3,6 +3,51 @@ import Foundation
 import XCTest
 
 final class MediaScannerTests: XCTestCase {
+    func testSecurityScopedLibraryRejectsUnavailableScopeButAllowsReadableUnsandboxedURL() throws {
+        let readable = FileManager.default.temporaryDirectory
+        XCTAssertNoThrow(
+            try SecurityScopedLibrary(
+                url: readable,
+                isBookmarkStale: false,
+                startAccessing: { _ in false },
+                isReadable: { _ in true }
+            )
+        )
+        XCTAssertThrowsError(
+            try SecurityScopedLibrary(
+                url: readable.appending(path: "unavailable"),
+                isBookmarkStale: false,
+                startAccessing: { _ in false },
+                isReadable: { _ in false }
+            )
+        ) { error in
+            guard case LibraryAuthorizationError.scopeUnavailable = error else {
+                return XCTFail("unexpected error: \(error)")
+            }
+        }
+    }
+
+    func testMissingSingleFileScopeAllowsScannerToConfirmDeletionFromReadableParent() async throws {
+        let temporaryURL = FileManager.default.temporaryDirectory
+            .appending(path: "media-memory-missing-scope-\(UUID().uuidString)", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: temporaryURL, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: temporaryURL) }
+        let missingVideo = temporaryURL.appending(path: "deleted.mp4")
+
+        let access = try SecurityScopedLibrary(
+            url: missingVideo,
+            isBookmarkStale: false,
+            allowMissingItemWhenParentIsReadable: true,
+            startAccessing: { _ in false },
+            isReadable: { $0.standardizedFileURL == temporaryURL.standardizedFileURL }
+        )
+        let result = try await MediaScanner().scanFile(fileURL: access.url)
+
+        XCTAssertTrue(result.assets.isEmpty)
+        XCTAssertTrue(result.errors.isEmpty)
+        XCTAssertTrue(result.isAuthoritativeComplete)
+    }
+
     func testRealVideoIsProbedWithoutChangingSource() async throws {
         let mediaDirectory = try TestMediaFixture.directoryURL()
         let video = try TestMediaFixture.videoURL()

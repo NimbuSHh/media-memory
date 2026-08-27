@@ -141,6 +141,30 @@ final class MediaProcessingTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: cachedB.path))
     }
 
+    func testLocalSourceAuthorizationIsLazyAndOnlyRunsWhenMaterializing() async throws {
+        let temporary = try ProcessingTemporaryDirectory()
+        let source = temporary.url.appending(path: "authorized.bin")
+        try Data(repeating: 0x61, count: 32 * 1_024).write(to: source)
+        let asset = try assetRecord(id: "authorized", source: source)
+        let recorder = SourceAuthorizationRecorder()
+        let cache = LocalSourceCache(
+            workRoot: temporary.url,
+            minimumFreeBytes: 0,
+            availableCapacity: { _ in Int64.max },
+            authorizeSource: { asset in await recorder.record(asset.id) }
+        )
+
+        let beforeMaterialization = await recorder.assetIDs()
+        XCTAssertEqual(beforeMaterialization, [])
+        let first = try await cache.localURL(for: asset)
+        let afterFirstMaterialization = await recorder.assetIDs()
+        XCTAssertEqual(afterFirstMaterialization, [asset.id])
+        let second = try await cache.localURL(for: asset)
+        XCTAssertEqual(first, second)
+        let afterCachedReuse = await recorder.assetIDs()
+        XCTAssertEqual(afterCachedReuse, [asset.id])
+    }
+
     func testLocalSourceCacheRefusesCopyWhenReserveWouldBeConsumed() async throws {
         let temporary = try ProcessingTemporaryDirectory()
         let source = temporary.url.appending(path: "large.bin")
@@ -398,5 +422,17 @@ private actor SourceLeaseTestControl {
     func finish() {
         finishContinuation?.resume()
         finishContinuation = nil
+    }
+}
+
+private actor SourceAuthorizationRecorder {
+    private var recordedAssetIDs: [String] = []
+
+    func record(_ assetID: String) {
+        recordedAssetIDs.append(assetID)
+    }
+
+    func assetIDs() -> [String] {
+        recordedAssetIDs
     }
 }

@@ -7,6 +7,7 @@ struct ModelEndpointDraft: Equatable, Hashable, Sendable {
     var transport: ModelTransport
     var endpointURL = ""
     var modelID = ""
+    var authentication: ModelAuthentication = .none
     var apiKey = ""
 }
 
@@ -39,6 +40,12 @@ struct ModelTestState: Equatable {
     var phase: ModelTestPhase = .untested
     var message = "未测试"
     var draftSignature: Int?
+}
+
+struct AppBackgroundWarning: Identifiable, Equatable {
+    let id: String
+    let title: String
+    let detail: String
 }
 
 /// 视频队列总览：以视频为单位的处理进度。
@@ -128,6 +135,7 @@ final class AppModel: ObservableObject {
     @Published private(set) var isSearching = false
     @Published private(set) var isLibraryBusy = false
     @Published private(set) var isSettingsLoading = false
+    @Published private(set) var settingsCredentialWarning: String?
     @Published private(set) var isSavingSettings = false
     @Published private(set) var isTestingModels = false
     @Published private(set) var startupPhase = AppStartupPhase.loadingLocalData
@@ -136,6 +144,7 @@ final class AppModel: ObservableObject {
     @Published private(set) var searchStatusMessage = ""
     @Published private(set) var evidenceStatusMessage = "建库空闲"
     @Published private(set) var descriptionStatusMessage = "描述空闲"
+    @Published private(set) var backgroundWarnings: [AppBackgroundWarning] = []
     @Published var errorMessage: String?
 
     private var database: MediaDatabase?
@@ -174,6 +183,7 @@ final class AppModel: ObservableObject {
     private var playerAssetID: String?
     private var searchGeneration = 0
     private var serviceGeneration = 0
+    private var authenticationMigrationRoles: Set<ModelRole> = []
     private var detailGeneration = 0
     private var playerGeneration = 0
     private var libraryRefreshGeneration = 0
@@ -467,6 +477,24 @@ final class AppModel: ObservableObject {
         }
     }
 
+    func reauthorizeRoot(_ root: LibraryRootRecord, using url: URL) {
+        runLibraryOperation(status: "正在更新媒体库授权…") { model in
+            guard let database = model.database else { return }
+            let selected = url.standardizedFileURL
+            let expected = URL(fileURLWithPath: root.path).standardizedFileURL
+            guard selected.path == expected.path else {
+                throw AppLifecycleError.reauthorizationTargetMismatch(expected: expected.path)
+            }
+            let bookmark = try await LibraryAuthorization.createReadOnlyBookmarkAsync(for: selected)
+            let access = try await LibraryAuthorization.resolveAsync(bookmark: bookmark)
+            try await database.updateLibraryRootBookmark(id: root.id, bookmark: bookmark)
+            model.scopedLibraries[root.id] = access
+            model.clearBackgroundWarning(id: "library.\(root.id)")
+            try await model.refreshLibrary()
+            model.statusMessage = "已重新授权：\(root.name)"
+        }
+    }
+
     func cancelScan() {
         scanTask?.cancel()
         scanStatusMessage = "正在停止扫描…"
@@ -485,6 +513,9 @@ final class AppModel: ObservableObject {
         isEvidencePaused = false
         evidenceLaneFailure = nil
         segmentationLaneFailure = nil
+        clearBackgroundWarning(id: "lane.segmentation")
+        clearBackgroundWarning(id: "lane.evidence")
+        clearBackgroundWarning(id: "lane.queue")
         startSegmentationLane()
         startEvidenceLane()
     }
@@ -492,6 +523,8 @@ final class AppModel: ObservableObject {
     func startDescriptionProcessing() {
         isDescriptionPaused = false
         descriptionLaneFailure = nil
+        clearBackgroundWarning(id: "lane.description")
+        clearBackgroundWarning(id: "lane.queue")
         startDescriptionLane()
     }
 
@@ -637,10 +670,12 @@ final class AppModel: ObservableObject {
     /// 空格键播放/暂停。
     func togglePlayback() {
         guard let player else { return }
-        if player.timeControlStatus == .playing {
-            player.pause()
-        } else {
+        if player.timeControlStatus == .paused {
             player.play()
+        } else {
+            // waitingToPlayAtSpecifiedRate 也属于已经请求播放；此时再次按空格
+            // 应该取消播放，而不是重复发送 play()。
+            player.pause()
         }
     }
 
@@ -654,6 +689,7 @@ final class AppModel: ObservableObject {
     func openSettings() {
         guard let configuration else { return }
         settingsKeyLoadTask?.cancel()
+        settingsCredentialWarning = nil
         settingsDraft = ModelSettingsDraft(
             asr: Self.endpointDraft(configuration.asr),
             aligner: Self.endpointDraft(configuration.aligner),
@@ -664,18 +700,32 @@ final class AppModel: ObservableObject {
         )
         resetModelTestStates()
         isSettingsPresented = true
+        let credentialRoles = configuration.credentialRoles
+        guard !credentialRoles.isEmpty else {
+            isSettingsLoading = false
+            settingsKeyLoadTask = nil
+            return
+        }
         isSettingsLoading = true
         settingsKeyLoadTask = Task { [weak self] in
             let credentials: ModelCredentials
             do {
-                credentials = try await KeychainStore.loadModelCredentialsAsync()
+                credentials = try await KeychainStore.loadModelCredentialsAsync(
+                    for: credentialRoles
+                )
             } catch is CancellationError {
                 return
             } catch {
                 guard let self else { return }
                 self.isSettingsLoading = false
                 self.settingsKeyLoadTask = nil
-                self.present(error)
+                self.recordBackgroundWarning(
+                    id: "settings.keychain",
+                    title: "无法读取模型凭据",
+                    detail: "请在模型设置中重新输入需要 Bearer 鉴权的 API key。\n\(error.localizedDescription)"
+                )
+                self.settingsCredentialWarning =
+                    "无法读取旧版模型凭据。请重新输入；保存时 macOS 可能要求授权迁移。\n\(error.localizedDescription)"
                 return
             }
             guard !Task.isCancelled, let self, self.isSettingsPresented else { return }
@@ -683,6 +733,7 @@ final class AppModel: ObservableObject {
             self.settingsDraft.aligner.apiKey = credentials.aligner
             self.settingsDraft.embedding.apiKey = credentials.embedding
             self.settingsDraft.description.apiKey = credentials.description
+            self.clearBackgroundWarning(id: "settings.keychain")
             self.isSettingsLoading = false
             self.settingsKeyLoadTask = nil
         }
@@ -709,7 +760,48 @@ final class AppModel: ObservableObject {
         settingsKeyLoadTask = nil
         cancelModelTests()
         isSettingsLoading = false
+        settingsCredentialWarning = nil
         isSettingsPresented = false
+    }
+
+    func loadCredentialForSettingsIfNeeded(_ role: ModelRole) {
+        guard isSettingsPresented,
+              !isSettingsLoading,
+              settingsDraft.endpoint(for: role).authentication == .bearer,
+              settingsDraft.endpoint(for: role).apiKey.isEmpty else { return }
+        isSettingsLoading = true
+        settingsKeyLoadTask?.cancel()
+        settingsKeyLoadTask = Task { [weak self] in
+            defer {
+                self?.isSettingsLoading = false
+                self?.settingsKeyLoadTask = nil
+            }
+            do {
+                let credentials = try await KeychainStore.loadModelCredentialsAsync(for: [role])
+                guard !Task.isCancelled, let self, self.isSettingsPresented,
+                      self.settingsDraft.endpoint(for: role).authentication == .bearer else {
+                    return
+                }
+                self.setSettingsAPIKey(credentials[role], for: role)
+                self.settingsCredentialWarning = credentials[role].isEmpty
+                    ? "未找到该能力的旧密钥，请重新输入后保存。" : nil
+            } catch is CancellationError {
+                return
+            } catch {
+                guard let self else { return }
+                self.settingsCredentialWarning =
+                    "无法读取旧版模型凭据。请重新输入；保存时 macOS 可能要求授权迁移。\n\(error.localizedDescription)"
+            }
+        }
+    }
+
+    private func setSettingsAPIKey(_ value: String, for role: ModelRole) {
+        switch role {
+        case .asr: settingsDraft.asr.apiKey = value
+        case .aligner: settingsDraft.aligner.apiKey = value
+        case .embedding: settingsDraft.embedding.apiKey = value
+        case .description: settingsDraft.description.apiKey = value
+        }
     }
 
     func modelTestState(for role: ModelRole) -> ModelTestState {
@@ -853,6 +945,7 @@ final class AppModel: ObservableObject {
             transport: endpoint.transport,
             endpointURL: endpoint.endpointURL?.absoluteString ?? "",
             modelID: endpoint.modelID,
+            authentication: endpoint.authentication,
             apiKey: ""
         )
     }
@@ -863,7 +956,8 @@ final class AppModel: ObservableObject {
             return ModelEndpoint(
                 transport: value.transport,
                 endpointURL: value.transport.requiresEndpoint ? URL(string: urlText) : nil,
-                modelID: value.modelID.trimmingCharacters(in: .whitespacesAndNewlines)
+                modelID: value.modelID.trimmingCharacters(in: .whitespacesAndNewlines),
+                authentication: value.authentication
             )
         }
         let worker = ModelConfiguration.Worker(
@@ -926,12 +1020,19 @@ final class AppModel: ObservableObject {
             let core = try await Self.loadLocalCore()
             try Task.checkCancellation()
             configuration = core.configuration
+            authenticationMigrationRoles = core.authenticationMigrationRoles
             instanceLock = core.instanceLock
             database = core.database
             readDatabase = core.readDatabase
             searchDatabase = core.searchDatabase
             workRoot = core.workRoot
-            let sourceCache = LocalSourceCache(workRoot: core.workRoot)
+            let sourceCache = LocalSourceCache(
+                workRoot: core.workRoot,
+                authorizeSource: { [weak self] asset in
+                    guard let self else { throw CancellationError() }
+                    _ = try await self.authorizeLibrary(for: asset)
+                }
+            )
             self.sourceCache = sourceCache
             segmenter = ContentSegmenter(
                 database: core.database,
@@ -944,15 +1045,29 @@ final class AppModel: ObservableObject {
                 database: core.searchDatabase,
                 configuration: core.configuration
             )
-            // Give semantic segmentation ownership before publishing the new
-            // library snapshot. This removes scan-time compatibility ranges,
-            // so newly added videos never flash fixed 20-second cards in UI.
-            if let segmenter {
-                segmentationProgress = try await segmenter.prepareQueue()
+            // This is DB-only ownership reconciliation. Keep it before the
+            // first snapshot so legacy fixed-duration cards never flash, but
+            // degrade locally instead of turning maintenance into a startup alert.
+            do {
+                segmentationProgress = try await segmenter?.prepareQueue() ?? segmentationProgress
+                clearBackgroundWarning(id: "maintenance.queue")
+            } catch {
+                recordBackgroundWarning(
+                    id: "maintenance.queue",
+                    title: "后台队列维护失败",
+                    detail: error.localizedDescription
+                )
             }
             try await refreshLibrary()
             startupPhase = .ready
             statusMessage = roots.isEmpty ? "请选择媒体目录" : "已就绪"
+            if !authenticationMigrationRoles.isEmpty {
+                recordBackgroundWarning(
+                    id: "settings.authentication-migration",
+                    title: "请确认模型鉴权方式",
+                    detail: "旧配置没有记录鉴权模式。为避免不必要地访问钥匙串，模型服务会等待你在“模型设置”中确认并保存。"
+                )
+            }
         } catch {
             guard !(error is CancellationError) else { return }
             startupPhase = .failed
@@ -973,6 +1088,7 @@ final class AppModel: ObservableObject {
         let readDatabase: MediaDatabase
         let searchDatabase: MediaDatabase
         let workRoot: URL
+        let authenticationMigrationRoles: Set<ModelRole>
     }
 
     /// nonisolated async：在全局执行器上打开数据库与读取配置，
@@ -1001,11 +1117,13 @@ final class AppModel: ObservableObject {
             database: database,
             readDatabase: readDatabase,
             searchDatabase: searchDatabase,
-            workRoot: workRoot
+            workRoot: workRoot,
+            authenticationMigrationRoles: loadedConfiguration.authenticationMigrationRoles
         )
     }
 
-    /// 后台维护：孤儿文件清扫、书签解析与续期、服务配置、车道启动。
+    /// 后台维护只处理本机派生数据与模型运行时。媒体书签严格延迟到
+    /// 扫描、源缓存或播放真正需要该根时再解析，避免启动唤醒 NAS。
     private func bootstrapMaintenance(generation: Int) async {
         guard let database, let searchDatabase, let sourceCache, let workRoot else { return }
         do {
@@ -1018,41 +1136,76 @@ final class AppModel: ObservableObject {
             // descriptions recover immediately even when models are offline.
             try await database.reconcileDescribeJobs()
             try await refreshJobs()
-            try Task.checkCancellation()
-            try await Self.runCleanup(database: database, workRoot: workRoot)
-            try Task.checkCancellation()
-            await renewBookmarks()
-            try Task.checkCancellation()
-            guard generation == serviceGeneration else { return }
-            guard let configuration else { return }
-            do {
-                let credentials = try await KeychainStore.loadModelCredentialsAsync()
-                let services = try await Self.makeServices(
-                    configuration: configuration,
-                    credentials: credentials,
-                    database: database,
-                    searchDatabase: searchDatabase,
-                    sourceCache: sourceCache,
-                    workRoot: workRoot
-                )
-                try Task.checkCancellation()
-                guard generation == serviceGeneration else { return }
-                install(services)
-                try await prepareIndexQueue(
-                    autoStart: scanTask == nil && libraryTask == nil && settingsSaveTask == nil
-                )
-            } catch {
-                statusMessage = "本地浏览和字面搜索已可用；请在模型设置中检查服务"
-                errorMessage = "模型服务尚未就绪：\(error.localizedDescription)"
-            }
-            if generation == serviceGeneration { maintenanceTask = nil }
+            clearBackgroundWarning(id: "maintenance.queue")
         } catch is CancellationError {
             if generation == serviceGeneration { maintenanceTask = nil }
+            return
         } catch {
             guard generation == serviceGeneration else { return }
+            recordBackgroundWarning(
+                id: "maintenance.queue",
+                title: "后台队列维护失败",
+                detail: error.localizedDescription
+            )
             maintenanceTask = nil
-            present(error)
+            return
         }
+
+        do {
+            try await Self.runCleanup(database: database, workRoot: workRoot)
+            clearBackgroundWarning(id: "maintenance.cleanup")
+        } catch is CancellationError {
+            if generation == serviceGeneration { maintenanceTask = nil }
+            return
+        } catch {
+            recordBackgroundWarning(
+                id: "maintenance.cleanup",
+                title: "部分临时文件尚未清理",
+                detail: "应用会在下次启动重试。\n\(error.localizedDescription)"
+            )
+        }
+
+        guard generation == serviceGeneration, let configuration else { return }
+        if !authenticationMigrationRoles.isEmpty {
+            statusMessage = "本地浏览和字面搜索已可用；请确认模型鉴权方式"
+            maintenanceTask = nil
+            return
+        }
+        do {
+            let roles = configuration.credentialRoles
+            let credentials = roles.isEmpty
+                ? ModelCredentials()
+                : try await KeychainStore.loadModelCredentialsAsync(for: roles)
+            for role in roles where credentials[role].isEmpty {
+                throw AppLifecycleError.missingBearerCredential(role)
+            }
+            let services = try await Self.makeServices(
+                configuration: configuration,
+                credentials: credentials,
+                database: database,
+                searchDatabase: searchDatabase,
+                sourceCache: sourceCache,
+                workRoot: workRoot
+            )
+            try Task.checkCancellation()
+            guard generation == serviceGeneration else { return }
+            install(services)
+            clearBackgroundWarning(id: "maintenance.models")
+            try await prepareIndexQueue(
+                autoStart: scanTask == nil && libraryTask == nil && settingsSaveTask == nil
+            )
+        } catch is CancellationError {
+            if generation == serviceGeneration { maintenanceTask = nil }
+            return
+        } catch {
+            statusMessage = "本地浏览和字面搜索已可用；请在模型设置中检查服务"
+            recordBackgroundWarning(
+                id: "maintenance.models",
+                title: "模型服务尚未就绪",
+                detail: error.localizedDescription
+            )
+        }
+        if generation == serviceGeneration { maintenanceTask = nil }
     }
 
     private nonisolated static func runCleanup(
@@ -1089,33 +1242,45 @@ final class AppModel: ObservableObject {
         didRecoverInterruptedJobs = true
     }
 
-    /// 书签解析可能触达慢速或离线的远程卷，逐个在后台线程进行；
-    /// 单个失败只提示，不阻塞其他根。
-    private func renewBookmarks() async {
-        guard let database else { return }
-        for root in roots where root.isEnabled {
-            guard !Task.isCancelled, libraryTask == nil else { return }
-            do {
-                let access = try await LibraryAuthorization.resolveAsync(bookmark: root.bookmark)
-                guard !Task.isCancelled,
-                      libraryTask == nil,
-                      roots.contains(where: { $0.id == root.id && $0.isEnabled }) else { return }
-                scopedLibraries[root.id] = access
-                if access.isBookmarkStale {
+    private func authorizeLibrary(for asset: MediaAssetRecord) async throws -> SecurityScopedLibrary {
+        guard let root = roots.first(where: { $0.id == asset.rootID && $0.isEnabled }) else {
+            throw AppLifecycleError.libraryRootUnavailable
+        }
+        return try await authorizeLibrary(root)
+    }
+
+    private func authorizeLibrary(_ root: LibraryRootRecord) async throws -> SecurityScopedLibrary {
+        if let existing = scopedLibraries[root.id] { return existing }
+        do {
+            let access = try await LibraryAuthorization.resolveAsync(
+                bookmark: root.bookmark,
+                allowMissingItemWhenParentIsReadable: root.kind == .file
+            )
+            try Task.checkCancellation()
+            scopedLibraries[root.id] = access
+            clearBackgroundWarning(id: "library.\(root.id)")
+            if access.isBookmarkStale, let database {
+                do {
                     let renewed = try await LibraryAuthorization.createReadOnlyBookmarkAsync(
                         for: access.url
                     )
-                    guard !Task.isCancelled,
-                          libraryTask == nil,
-                          roots.contains(where: { $0.id == root.id && $0.isEnabled }) else { return }
                     try await database.updateLibraryRootBookmark(id: root.id, bookmark: renewed)
+                } catch {
+                    recordBackgroundWarning(
+                        id: "library.\(root.id)",
+                        title: "媒体库授权需要更新",
+                        detail: "\(root.path)\n请右键该媒体库并选择“重新授权”。\n\(error.localizedDescription)"
+                    )
                 }
-            } catch {
-                guard !Task.isCancelled,
-                      libraryTask == nil,
-                      roots.contains(where: { $0.id == root.id && $0.isEnabled }) else { return }
-                errorMessage = "目录或文件授权已经失效：\(root.path)\n\(error.localizedDescription)"
             }
+            return access
+        } catch {
+            recordBackgroundWarning(
+                id: "library.\(root.id)",
+                title: "无法访问媒体库",
+                detail: "\(root.path)\n请右键该媒体库并选择“重新授权”。\n\(error.localizedDescription)"
+            )
+            throw error
         }
     }
 
@@ -1131,7 +1296,11 @@ final class AppModel: ObservableObject {
             let newConfiguration = Self.configuration(from: draft)
             try newConfiguration.validate()
             let newCredentials = Self.credentials(from: draft)
-            guard let database, let searchDatabase, let workRoot else { return }
+            for role in newConfiguration.credentialRoles where newCredentials[role].isEmpty {
+                throw AppLifecycleError.missingBearerCredential(role)
+            }
+            guard let database, let searchDatabase, let workRoot,
+                  let previousConfiguration = configuration else { return }
             guard let sourceCache else { return }
             let interruptedMaintenance = maintenanceTask
             interruptedMaintenance?.cancel()
@@ -1158,18 +1327,50 @@ final class AppModel: ObservableObject {
                 workRoot: workRoot
             )
             try Task.checkCancellation()
-            let previousCredentials = try await KeychainStore.loadModelCredentialsAsync()
-            try await KeychainStore.saveModelCredentialsAsync(newCredentials)
+            let previousRoles = previousConfiguration.credentialRoles
+            let touchedCredentialRoles = previousRoles.union(newConfiguration.credentialRoles)
+            let previousCredentials: ModelCredentials?
+            let requiresACLReplacement: Bool
             do {
+                previousCredentials = try await KeychainStore.loadModelCredentialsAsync(
+                    for: touchedCredentialRoles
+                )
+                requiresACLReplacement = false
+            } catch let error as KeychainError where error.isAccessDenied {
+                previousCredentials = nil
+                requiresACLReplacement = true
+            }
+            do {
+                if requiresACLReplacement {
+                    try await KeychainStore.replaceInaccessibleModelCredentialsAsync(
+                        newCredentials,
+                        for: touchedCredentialRoles
+                    )
+                } else {
+                    try await KeychainStore.saveModelCredentialsAsync(
+                        newCredentials,
+                        for: touchedCredentialRoles
+                    )
+                }
                 try await ModelConfigurationStore.saveAsync(newConfiguration)
             } catch {
-                try? await KeychainStore.saveModelCredentialsAsync(previousCredentials)
+                if let previousCredentials {
+                    try? await KeychainStore.saveModelCredentialsAsync(
+                        previousCredentials,
+                        for: touchedCredentialRoles
+                    )
+                }
                 throw error
             }
             try Task.checkCancellation()
             guard generation == serviceGeneration else { return }
             configuration = newConfiguration
+            authenticationMigrationRoles = []
             install(services)
+            clearBackgroundWarning(id: "maintenance.models")
+            clearBackgroundWarning(id: "settings.keychain")
+            clearBackgroundWarning(id: "settings.authentication-migration")
+            settingsCredentialWarning = nil
             // Retire the old service snapshot without synchronously stopping its
             // Worker. An in-flight old query owns that snapshot until it finishes;
             // its generation is invalidated so it cannot publish stale ranking.
@@ -1185,11 +1386,14 @@ final class AppModel: ObservableObject {
             isSettingsPresented = false
             statusMessage = "模型设置已保存"
             try await prepareIndexQueue(autoStart: false)
-            await KeychainStore.deleteLegacyOMLXKeyAsync()
+            if !touchedCredentialRoles.isEmpty {
+                await KeychainStore.deleteLegacyOMLXKeyAsync()
+            }
         } catch is CancellationError {
             statusMessage = "模型设置保存已停止"
         } catch {
-            present(error)
+            settingsCredentialWarning = error.localizedDescription
+            statusMessage = "模型设置尚未保存"
         }
     }
 
@@ -1347,6 +1551,7 @@ final class AppModel: ObservableObject {
 
     private func scan(roots rootsToScan: [LibraryRootRecord]) async {
         errorMessage = nil
+        clearBackgroundWarning(id: "scan")
         defer {
             isScanning = false
             scanTask = nil
@@ -1363,8 +1568,7 @@ final class AppModel: ObservableObject {
                     if let existing = scopedLibraries[root.id] {
                         access = existing
                     } else {
-                        access = try await LibraryAuthorization.resolveAsync(bookmark: root.bookmark)
-                        scopedLibraries[root.id] = access
+                        access = try await authorizeLibrary(root)
                     }
                     let result: MediaScanResult
                     switch root.kind {
@@ -1389,7 +1593,11 @@ final class AppModel: ObservableObject {
             }
             try await refreshLibrary()
             if !scanErrors.isEmpty {
-                errorMessage = scanErrors.joined(separator: "\n")
+                recordBackgroundWarning(
+                    id: "scan",
+                    title: "部分媒体未能扫描",
+                    detail: scanErrors.joined(separator: "\n")
+                )
             }
             scanStatusMessage = "扫描完成：\(assets.count) 个视频"
             if segmenter != nil {
@@ -1399,7 +1607,7 @@ final class AppModel: ObservableObject {
             scanStatusMessage = "扫描已停止；已提交的数据保持完整"
         } catch {
             scanStatusMessage = "扫描失败：\(error.localizedDescription)"
-            errorMessage = scanStatusMessage
+            recordBackgroundWarning(id: "scan", title: "扫描失败", detail: error.localizedDescription)
         }
     }
 
@@ -1615,7 +1823,11 @@ final class AppModel: ObservableObject {
         if let error {
             segmentationLaneFailure = error.localizedDescription
             evidenceStatusMessage = "语义分片失败：\(error.localizedDescription)"
-            errorMessage = evidenceStatusMessage
+            recordBackgroundWarning(
+                id: "lane.segmentation",
+                title: "语义分片已暂停",
+                detail: error.localizedDescription
+            )
         } else if cancelled {
             if indexTask == nil { evidenceStatusMessage = "建库已暂停" }
         } else if let summary, summary.failed > 0 {
@@ -1623,16 +1835,24 @@ final class AppModel: ObservableObject {
         } else if indexTask == nil {
             evidenceStatusMessage = "视频分片已处理到当前队尾"
         }
+        if error == nil {
+            clearBackgroundWarning(id: "lane.segmentation")
+        }
 
         if readDatabase != nil { try? await refreshJobs() }
         var reconciliationSucceeded = true
         if !cancelled, error == nil {
             do {
                 try await prepareIndexQueue(autoStart: false)
+                clearBackgroundWarning(id: "lane.queue")
             } catch {
                 reconciliationSucceeded = false
                 segmentationLaneFailure = error.localizedDescription
-                errorMessage = "处理队列协调失败：\(error.localizedDescription)"
+                recordBackgroundWarning(
+                    id: "lane.queue",
+                    title: "处理队列协调失败",
+                    detail: error.localizedDescription
+                )
             }
         }
         let processedAny = (summary?.succeeded ?? 0) + (summary?.failed ?? 0) > 0
@@ -1690,7 +1910,11 @@ final class AppModel: ObservableObject {
                 descriptionLaneFailure = error.localizedDescription
                 descriptionStatusMessage = message
             }
-            errorMessage = message
+            recordBackgroundWarning(
+                id: lane == .evidence ? "lane.evidence" : "lane.description",
+                title: "\(laneName)已暂停",
+                detail: error.localizedDescription
+            )
         } else if cancelled {
             message = "\(laneName)已暂停"
             if lane == .evidence {
@@ -1713,6 +1937,11 @@ final class AppModel: ObservableObject {
                 descriptionStatusMessage = message
             }
         }
+        if error == nil {
+            clearBackgroundWarning(
+                id: lane == .evidence ? "lane.evidence" : "lane.description"
+            )
+        }
 
         if let asset = selectedAsset, selectedResult == nil {
             loadAssetDetail(for: asset)
@@ -1723,6 +1952,7 @@ final class AppModel: ObservableObject {
         if !cancelled, error == nil, indexer != nil {
             do {
                 try await prepareIndexQueue(autoStart: false)
+                clearBackgroundWarning(id: "lane.queue")
             } catch {
                 reconciliationSucceeded = false
                 let detail = error.localizedDescription
@@ -1731,7 +1961,11 @@ final class AppModel: ObservableObject {
                 } else {
                     descriptionLaneFailure = detail
                 }
-                errorMessage = "处理队列协调失败：\(detail)"
+                recordBackgroundWarning(
+                    id: "lane.queue",
+                    title: "处理队列协调失败",
+                    detail: detail
+                )
             }
         }
         let processedAny = (summary?.succeeded ?? 0) + (summary?.failed ?? 0) > 0
@@ -1760,15 +1994,21 @@ final class AppModel: ObservableObject {
         let requiresEvidence = indexer != nil
         let requiresDescriptions = describeQueue != nil
         do {
-            return try await sourceCache.removeIfUnused(assetID: assetID) {
+            let removed = try await sourceCache.removeIfUnused(assetID: assetID) {
                 try await !database.hasActiveProcessingWork(
                     assetID: assetID,
                     requiresEvidence: requiresEvidence,
                     requiresDescriptions: requiresDescriptions
                 )
             }
+            clearBackgroundWarning(id: "maintenance.source-cache")
+            return removed
         } catch {
-            errorMessage = "清理本地视频缓存失败：\(error.localizedDescription)"
+            recordBackgroundWarning(
+                id: "maintenance.source-cache",
+                title: "本地视频缓存尚未清理",
+                detail: error.localizedDescription
+            )
             return false
         }
     }
@@ -1864,10 +2104,11 @@ final class AppModel: ObservableObject {
         playerAssetID = nil
         playerError = nil
         isPlayerLoading = true
-        let url = URL(fileURLWithPath: asset.standardizedPath)
         playerPreparationTask = Task { [weak self] in
             guard let self else { return }
             do {
+                _ = try await self.authorizeLibrary(for: asset)
+                let url = URL(fileURLWithPath: asset.standardizedPath)
                 let newPlayer = try await Self.preparePlayer(url: url)
                 try Task.checkCancellation()
                 guard self.playerGeneration == generation,
@@ -1959,6 +2200,20 @@ final class AppModel: ObservableObject {
         ][stage] ?? stage
     }
 
+    func dismissBackgroundWarning(_ warning: AppBackgroundWarning) {
+        clearBackgroundWarning(id: warning.id)
+    }
+
+    private func recordBackgroundWarning(id: String, title: String, detail: String) {
+        backgroundWarnings.removeAll { $0.id == id }
+        backgroundWarnings.append(AppBackgroundWarning(id: id, title: title, detail: detail))
+        backgroundWarnings.sort { $0.id < $1.id }
+    }
+
+    private func clearBackgroundWarning(id: String) {
+        backgroundWarnings.removeAll { $0.id == id }
+    }
+
     private func present(_ error: Error) {
         errorMessage = error.localizedDescription
         statusMessage = "发生错误"
@@ -1967,9 +2222,21 @@ final class AppModel: ObservableObject {
 
 private enum AppLifecycleError: Error, LocalizedError {
     case databaseUnavailable
+    case libraryRootUnavailable
+    case missingBearerCredential(ModelRole)
+    case reauthorizationTargetMismatch(expected: String)
 
     var errorDescription: String? {
-        "本地数据库尚未就绪，请稍后重试。"
+        switch self {
+        case .databaseUnavailable:
+            "本地数据库尚未就绪，请稍后重试。"
+        case .libraryRootUnavailable:
+            "该视频所属媒体库已被移除或停用。"
+        case let .missingBearerCredential(role):
+            "\(role.displayName)已启用 Bearer 鉴权，请填写 API key。"
+        case let .reauthorizationTargetMismatch(expected):
+            "请选择原媒体库位置：\(expected)"
+        }
     }
 }
 

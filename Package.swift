@@ -21,6 +21,7 @@ let package = Package(
             ],
             linkerSettings: [
                 .linkedFramework("AVFoundation"),
+                .linkedFramework("LocalAuthentication"),
                 .linkedFramework("Security"),
                 .linkedFramework("Vision"),
                 .linkedFramework("Accelerate")

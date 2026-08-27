@@ -10,6 +10,11 @@ version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$repo
 artifact_name="Media-Memory-${version}-arm64.dmg"
 artifact="$release_directory/$artifact_name"
 
+if [[ "${MEDIA_MEMORY_SIGNING_IDENTITY:-Media Memory Release Signing}" == "-" ]]; then
+    print -u2 -- "Release DMG 拒绝使用 ad-hoc 签名。"
+    exit 1
+fi
+
 "$script_directory/build-app.sh"
 
 /bin/rm -rf "$staging_directory"

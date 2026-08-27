@@ -9,12 +9,22 @@
 1. 工作区和 Git 索引干净；
 2. 默认测试通过，真实模型测试的执行或跳过原因有记录；
 3. Release `.app` 是 arm64，资源包包含默认配置与本地 Worker；
-4. App 使用临时签名，`codesign --verify --deep --strict` 通过；
+4. App 使用 `Media Memory Release Signing` 长期自签名身份，钥匙串身份、App 内嵌叶证书与仓库 DER 公钥证书基线一致；`codesign --verify --deep --strict` 通过；
 5. DMG 可挂载，包含 App、Applications 链接、MIT 许可证和安装说明；
 6. SHA-256 与最终上传的 DMG 一致；
 7. 解包检查不含 API key、环境文件、数据库、测试视频、个人路径或模型权重；
 8. 在普通 macOS 15+ 用户会话完成：下载 → 拖入 Applications → 隐私与安全放行 → 配置 → 四项测试 → 添加视频 → 搜索与播放 → 重启恢复；
-9. Git tag、Info.plist 版本、DMG 名称、Release 标题和 Homebrew Cask 版本一致。
+9. 两个连续 `CFBundleVersion` 构建的证书 SHA-256、Authority 和 designated requirement 完全一致；
+10. Git tag、Info.plist 版本、DMG 名称、Release 标题和 Homebrew Cask 版本一致。
+11. v0.1.1 → v0.1.2 迁移回归必须覆盖旧配置鉴权确认、旧 Keychain ACL 显式替换及部分失败重试、媒体书签按需重新授权，以及数据库与派生结果保留；Release notes 必须说明首次现场升级可能出现的系统确认。
+
+## 发布身份
+
+v0.1.2 已建立唯一的 `Media Memory Release Signing` 身份：私钥只在发布者本机登录钥匙串，仓库只提交不含私钥的 DER 叶证书 `Packaging/Signing/Media-Memory-Release-Signing.cer`，作为以后正式构建的身份基线。贡献者不需要该私钥；本地开发使用下文的显式 ad-hoc 构建即可。
+
+当前发布流程不创建或传输 `.p12`。以后若从“钥匙串访问”导出加密备份，私钥、`.p12` 和密码仍不得进入仓库、`.build`、DMG 或 GitHub Release。若私钥在尚无可用备份时丢失，只能提升版本并建立新的公开身份基线，不能用同名新证书冒充恢复。
+
+自签名身份没有可供用户系统自动查询的 CA 吊销通道。若私钥泄露或有合理泄露怀疑，应立即停用旧 key、保留并停止覆盖既有 Release、公开安全告警，提升版本并建立新的证书与 DR 基线；不能声称旧签名会自动失效。
 
 ## 本地构建
 
@@ -28,7 +38,15 @@
 .build/Media Memory.app
 ```
 
-构建脚本使用完整 Xcode、Release 配置与临时签名，不读取用户模型配置或钥匙串。
+构建脚本使用完整 Xcode、Release 配置和钥匙串中的长期签名身份，但不读取应用模型配置、模型 API key、媒体书签或数据库。仅做本地开发时可以显式使用 `MEDIA_MEMORY_SIGNING_IDENTITY=- ./Scripts/build-app.sh`；Release 和稳定性验证脚本会拒绝 ad-hoc 签名。
+
+发布前验证两个连续构建号：
+
+```bash
+./Scripts/verify-signing-stability.sh
+```
+
+正式签名会逐字节核对钥匙串中的公开证书与仓库 DER 基线，再把 Bundle ID 与该证书的 SHA-1 明确写入 designated requirement。签名后会重新读取 App 的完整 DR，确认它确实绑定该指纹。验证脚本分别构建并回读当前 `CFBundleVersion` 和下一个构建号，比较 Authority、公开证书基线 SHA-256 与完整 designated requirement；任一不同即失败。
 
 ## 生成 DMG
 
@@ -44,7 +62,7 @@
 .build/releases/media-memory.rb
 ```
 
-最后一个文件是已经填入当前 DMG SHA-256 的 Homebrew Cask，可复制到 `NimbuSHh/homebrew-tap` 的 `Casks/media-memory.rb`。
+最后一个文件是已经填入当前 DMG SHA-256 的 Homebrew Cask。当前公开 Tap 尚未建立，因此它只是 Release 附件和未来建 Tap 时的审计输入，不能宣称现有 `brew install --cask NimbuSHh/tap/media-memory` 已可用。
 
 ## 创建 GitHub Release
 
@@ -54,9 +72,9 @@
 ./Scripts/publish-release.sh
 ```
 
-脚本从 Info.plist 读取版本，创建不可变的 `v<version>` tag，上传 DMG 与 SHA-256，并生成 Release notes。它不会覆盖既有 tag。
+脚本先确认 GitHub CLI 登录有效、当前 `main` 与远端提交完全一致，再执行双构建签名稳定性验证。耗时构建结束后会再次确认工作区、HEAD 与远端 main 未变化，再从 Info.plist 创建不复用的 `v<version>` tag，核对远端 tag 的 peeled commit，并上传 DMG、SHA-256、Cask 与固定迁移说明。它不会覆盖既有 tag，也不会在 Release 创建前补推未同步的 `main`；这里的“不复用”是脚本门禁，不代表仓库已经启用 GitHub Immutable Releases。
 
-## Homebrew Tap
+## Homebrew Tap（尚未建立）
 
 Tap 仓库结构：
 
@@ -66,14 +84,22 @@ NimbuSHh/homebrew-tap/
     └── media-memory.rb
 ```
 
-复制生成的 Cask 后先验证：
+只有在另行创建并推送公开 Tap 仓库后，才能复制生成的 Cask 并验证：
 
 ```bash
 brew audit --cask --strict NimbuSHh/tap/media-memory
 brew install --cask NimbuSHh/tap/media-memory
 ```
 
-由于应用未公证，Homebrew 安装后首次启动仍需在“系统设置 → 隐私与安全”中手动放行。本项目暂不申请进入官方 `homebrew/cask`。
+在 Tap 建立并完成现场审计前，README 和用户指南不得给出可执行的安装命令。应用未公证，即使未来通过 Tap 安装，首次启动仍需在“系统设置 → 隐私与安全”中手动放行。本项目暂不申请进入官方 `homebrew/cask`。
+
+## v0.1.1 → v0.1.2 身份迁移边界
+
+- `v0.1.1` 是 ad-hoc 签名，`v0.1.2` 首次采用稳定自签名；用户可能需要再次通过 Gatekeeper。
+- 应用启动不批量读取钥匙串，也不解析全部媒体书签。schema 1/2 旧配置没有鉴权字段，升级后模型建库和语义检索暂停，本地浏览与字面搜索继续；用户必须在模型设置中确认并保存一次鉴权方式。
+- 回环地址与 Worker 只被初步推断为无需鉴权，非回环地址初步推断为 Bearer；反例必须由用户确认。选择 Bearer 时才惰性读取对应旧 key，macOS 可能显示一次访问确认；本地无需鉴权模型不会为清理旧 key 而访问钥匙串。
+- 书签只在扫描、处理或播放时解析。若旧签名下的授权不可继续使用，侧栏显示非模态警告；用户右键原媒体库“重新授权”，数据库和派生结果原地保留。
+- 普通用户只接收已签名 App，不接收证书私钥或 `.p12`。
 
 ## 回滚
 
@@ -82,7 +108,7 @@ GitHub Release 和 tag 不覆盖、不复用。若发布产物有问题：
 1. 将有问题的 Release 标记为 prerelease 或删除 Release 入口；
 2. 保留原 tag 作为已发布事实，不把另一个二进制覆盖到同一版本；
 3. 修复后提升版本号，重新构建、校验并发布；
-4. Homebrew Cask 只更新到新的版本和 SHA-256。
+4. Release 附带的 Homebrew Cask 只更新到新的版本和 SHA-256；公开 Tap 建立前不宣称可安装。
 
 ## 0.1.1 验收记录（2026-08-26）
 
@@ -93,3 +119,13 @@ GitHub Release 和 tag 不覆盖、不复用。若发布产物有问题：
 - arm64、Bundle ID `io.github.nimbushh.media-memory`、版本 `0.1.1`、ad-hoc 签名和 DMG 完整性均通过；
 - 最终 DMG 隐私扫描未发现个人绝对路径、API key/私钥模式、数据库、测试视频或模型权重；
 - 最终 SHA-256 以同一 GitHub Release 中的 `.dmg.sha256` 附件为准；发布脚本会在上传前重新生成并校验。
+
+## 0.1.2 验收记录（2026-08-27）
+
+- 默认测试：109 项，106 项通过，2 项真实模型测试与 1 项性能测试按显式开关跳过，0 失败；
+- 显式真实模型测试：2 项通过，覆盖 ASR/对齐/OCR/向量冒烟和建库/搜索/描述/缓存闭环；10,000 个 2048 维向量的显式性能测试通过；
+- 连续 build 3/4 均由 `Media Memory Release Signing` 签名，公开证书 SHA-256 为 `c90b71af651fafe33f62510ca3d163065273f43266df9780e59d79f30ac40411`，Authority 与完整 designated requirement 一致；
+- 最终 arm64 App 为 `0.1.2 (3)`，Bundle ID 为 `io.github.nimbushh.media-memory`，`codesign --verify --deep --strict` 通过；
+- 最终 DMG 可挂载并通过映像校验，包含 App、Applications 链接、许可证和安装说明，SHA-256 文件校验通过；
+- 最终 DMG 扫描未发现私钥、`.p12`、数据库、个人绝对路径或模型权重；
+- 旧配置鉴权确认、无鉴权模型零 Keychain 访问、旧 ACL 显式替换与失败重试、媒体权限惰性解析和删除不确定性均有回归覆盖；首次从 ad-hoc 版本现场升级时仍按 Release notes 处理 Gatekeeper、Keychain 或媒体根的系统确认。

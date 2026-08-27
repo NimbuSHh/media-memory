@@ -33,6 +33,7 @@ work/
 *.p12
 *.p8
 *.cer
+!Packaging/Signing/Media-Memory-Release-Signing.cer
 *.crt
 *.der
 *.mobileprovision

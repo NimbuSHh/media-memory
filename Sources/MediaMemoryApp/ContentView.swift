@@ -14,6 +14,8 @@ struct ContentView: View {
     @State private var pendingAssetRemoval: MediaAssetRecord?
     @State private var selectedSegmentID: String?
     @State private var showFailureList = false
+    @State private var showBackgroundWarnings = false
+    @StateObject private var playbackKeyMonitor = PlaybackKeyMonitor()
     @FocusState private var focusedField: FocusedField?
 
     var body: some View {
@@ -93,6 +95,12 @@ struct ContentView: View {
         } message: { _ in
             Text("将删除该视频的识别结果、向量与描述缓存，并在后续扫描中保持排除；源文件不会被改动。")
         }
+        .onAppear {
+            playbackKeyMonitor.start(model: model)
+        }
+        .onDisappear {
+            playbackKeyMonitor.stop()
+        }
     }
 
     private var sidebar: some View {
@@ -117,6 +125,9 @@ struct ContentView: View {
                     .contextMenu {
                         Button("重新扫描\(root.kind == .directory ? "此目录" : "此文件")") {
                             model.rescanRoot(root)
+                        }
+                        Button("重新授权") {
+                            reauthorize(root)
                         }
                         Divider()
                         Button("从媒体库移除", role: .destructive) {
@@ -196,6 +207,20 @@ struct ContentView: View {
                         .foregroundStyle(.orange)
                         .popover(isPresented: $showFailureList) {
                             failureListPopover
+                        }
+                    }
+                    if !model.backgroundWarnings.isEmpty {
+                        Button {
+                            showBackgroundWarnings = true
+                        } label: {
+                            Label(
+                                "警告 \(model.backgroundWarnings.count)",
+                                systemImage: "exclamationmark.triangle"
+                            )
+                        }
+                        .foregroundStyle(.orange)
+                        .popover(isPresented: $showBackgroundWarnings) {
+                            backgroundWarningPopover
                         }
                     }
                 }
@@ -311,6 +336,37 @@ struct ContentView: View {
         }
     }
 
+    private var backgroundWarningPopover: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text("后台状态与权限警告")
+                .font(.headline)
+                .padding(12)
+            Divider()
+            ScrollView {
+                VStack(alignment: .leading, spacing: 12) {
+                    ForEach(model.backgroundWarnings) { warning in
+                        VStack(alignment: .leading, spacing: 5) {
+                            HStack {
+                                Text(warning.title).font(.callout.weight(.medium))
+                                Spacer()
+                                Button("清除") {
+                                    model.dismissBackgroundWarning(warning)
+                                }
+                                .buttonStyle(.borderless)
+                            }
+                            Text(warning.detail)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .textSelection(.enabled)
+                        }
+                    }
+                }
+                .padding(12)
+            }
+            .frame(width: 460, height: 280)
+        }
+    }
+
     private func laneProgress(
         title: String,
         progress: IndexingProgress,
@@ -386,7 +442,7 @@ struct ContentView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .contentShape(.rect)
                     .onTapGesture {
-                        focusedField = nil
+                        dismissSearchFocus()
                         model.select(result: result)
                     }
                     .listRowBackground(
@@ -400,9 +456,19 @@ struct ContentView: View {
 
     private func submitSearch() {
         model.submitSearch()
-        // 提交完成后把空格还给窗口级播放器快捷键；用户再次点击搜索框时
-        // 仍可正常输入带空格的查询。
+        dismissSearchFocus()
+    }
+
+    private func dismissSearchFocus() {
         focusedField = nil
+        // FocusState 只同步 SwiftUI 状态；macOS 的 field editor 可能仍是
+        // 第一响应者。等本轮提交事件结束后显式释放它，避免继续吞掉空格。
+        DispatchQueue.main.async {
+            guard let window = NSApp.keyWindow,
+                  let editor = window.firstResponder as? NSTextView,
+                  editor.isFieldEditor else { return }
+            window.makeFirstResponder(nil)
+        }
     }
 
     private func searchResultRow(_ result: SearchResult) -> some View {
@@ -742,12 +808,6 @@ struct ContentView: View {
                                     .allowsHitTesting(false)
                                 }
                             }
-                        // 空格：播放/暂停（零尺寸快捷键按钮，不影响布局）。
-                        Button(action: model.togglePlayback) { EmptyView() }
-                            .keyboardShortcut(.space, modifiers: [])
-                            .frame(width: 0, height: 0)
-                            .opacity(0)
-                            .accessibilityHidden(true)
                     } else {
                         ContentUnavailableView(
                             "无法播放",
@@ -1192,6 +1252,23 @@ struct ContentView: View {
         }
     }
 
+    private func reauthorize(_ root: LibraryRootRecord) {
+        let panel = NSOpenPanel()
+        panel.title = "重新授权媒体库"
+        panel.message = "请选择原位置：\(root.path)"
+        panel.prompt = "重新授权"
+        panel.canChooseFiles = root.kind == .file
+        panel.canChooseDirectories = root.kind == .directory
+        panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = false
+        panel.resolvesAliases = false
+        panel.directoryURL = URL(fileURLWithPath: root.path).deletingLastPathComponent()
+        panel.begin { response in
+            guard response == .OK, let url = panel.url else { return }
+            Task { @MainActor in model.reauthorizeRoot(root, using: url) }
+        }
+    }
+
     private func formatDuration(_ milliseconds: Int64) -> String {
         guard milliseconds > 0 else { return "—" }
         return formatTime(milliseconds)
@@ -1227,6 +1304,55 @@ private struct NativePlayerView: NSViewRepresentable {
         if view.player !== player {
             view.player = player
         }
+    }
+}
+
+/// 窗口内空格键只有一个处理入口。文本正在编辑时原样放行；其余情况下，
+/// 只要当前有播放器，就由 AppModel 切换一次播放状态并消费该事件。
+@MainActor
+private final class PlaybackKeyMonitor: ObservableObject {
+    private var token: Any?
+
+    func start(model: AppModel) {
+        guard token == nil else { return }
+        token = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak model] event in
+            guard let model,
+                  let eventWindow = event.window,
+                  eventWindow === NSApp.mainWindow,
+                  eventWindow === NSApp.keyWindow,
+                  event.keyCode == 49,
+                  Self.hasNoCommandModifiers(event),
+                  !Self.isEditingText(in: eventWindow),
+                  model.player != nil,
+                  !model.isSettingsPresented,
+                  model.errorMessage == nil else {
+                return event
+            }
+            // 长按只由第一次 keyDown 切换一次；重复事件也必须消费，不能再
+            // 落到 AVPlayerView 自己的空格处理上造成二次切换。
+            guard !event.isARepeat else { return nil }
+            model.togglePlayback()
+            return nil
+        }
+    }
+
+    func stop() {
+        guard let token else { return }
+        NSEvent.removeMonitor(token)
+        self.token = nil
+    }
+
+    private static func isEditingText(in window: NSWindow) -> Bool {
+        guard let responder = window.firstResponder else { return false }
+        if responder is NSTextField { return true }
+        guard let textView = responder as? NSTextView else { return false }
+        return textView.isEditable
+    }
+
+    private static func hasNoCommandModifiers(_ event: NSEvent) -> Bool {
+        let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        let nonCommandModifiers: NSEvent.ModifierFlags = [.capsLock, .numericPad, .function]
+        return modifiers.subtracting(nonCommandModifiers).isEmpty
     }
 }
 
@@ -1369,6 +1495,12 @@ private struct ModelSettingsView: View {
                                 .foregroundStyle(.secondary)
                         }
                     }
+                    if let warning = model.settingsCredentialWarning {
+                        Label(warning, systemImage: "exclamationmark.triangle.fill")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                            .textSelection(.enabled)
+                    }
                 }
 
                 ModelEndpointEditor(
@@ -1377,6 +1509,7 @@ private struct ModelSettingsView: View {
                     testState: model.modelTestState(for: .asr),
                     isAnyTestRunning: model.isTestingModels,
                     supportsLocalWorker: false,
+                    authenticationChanged: { model.loadCredentialForSettingsIfNeeded(.asr) },
                     testAction: { model.testModel(.asr) }
                 )
                 ModelEndpointEditor(
@@ -1385,6 +1518,7 @@ private struct ModelSettingsView: View {
                     testState: model.modelTestState(for: .aligner),
                     isAnyTestRunning: model.isTestingModels,
                     supportsLocalWorker: true,
+                    authenticationChanged: { model.loadCredentialForSettingsIfNeeded(.aligner) },
                     testAction: { model.testModel(.aligner) }
                 )
                 ModelEndpointEditor(
@@ -1393,6 +1527,7 @@ private struct ModelSettingsView: View {
                     testState: model.modelTestState(for: .embedding),
                     isAnyTestRunning: model.isTestingModels,
                     supportsLocalWorker: true,
+                    authenticationChanged: { model.loadCredentialForSettingsIfNeeded(.embedding) },
                     testAction: { model.testModel(.embedding) }
                 )
                 ModelEndpointEditor(
@@ -1401,6 +1536,7 @@ private struct ModelSettingsView: View {
                     testState: model.modelTestState(for: .description),
                     isAnyTestRunning: model.isTestingModels,
                     supportsLocalWorker: false,
+                    authenticationChanged: { model.loadCredentialForSettingsIfNeeded(.description) },
                     testAction: { model.testModel(.description) }
                 )
 
@@ -1461,6 +1597,7 @@ private struct ModelEndpointEditor: View {
     let testState: ModelTestState
     let isAnyTestRunning: Bool
     let supportsLocalWorker: Bool
+    let authenticationChanged: () -> Void
     let testAction: () -> Void
 
     var body: some View {
@@ -1491,11 +1628,20 @@ private struct ModelEndpointEditor: View {
                     .font(.caption)
                     .foregroundStyle(.orange)
                 }
+                Picker("鉴权", selection: $draft.authentication) {
+                    Text("无需鉴权").tag(ModelAuthentication.none)
+                    Text("Bearer API key").tag(ModelAuthentication.bearer)
+                }
+                .pickerStyle(.segmented)
             }
             TextField("模型名称", text: $draft.modelID)
-            if draft.transport.requiresEndpoint {
-                SecureField("API key（无鉴权服务可留空）", text: $draft.apiKey)
+            if draft.transport.requiresEndpoint, draft.authentication == .bearer {
+                SecureField("API key", text: $draft.apiKey)
                 Text("密钥只保存在 macOS 钥匙串；测试使用应用生成的音频和图片，不读取媒体库。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else if draft.transport.requiresEndpoint {
+                Text("无需鉴权时不会读取或写入该能力的钥匙串项目。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -1513,6 +1659,19 @@ private struct ModelEndpointEditor: View {
             Text(role.displayName)
         } footer: {
             Text(contractDescription)
+        }
+        .onChange(of: draft.transport) { _, transport in
+            if transport == .localWorker {
+                draft.authentication = .none
+                draft.apiKey = ""
+            }
+        }
+        .onChange(of: draft.authentication) { _, authentication in
+            if authentication == .none {
+                draft.apiKey = ""
+            } else {
+                authenticationChanged()
+            }
         }
     }
 

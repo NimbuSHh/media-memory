@@ -30,15 +30,27 @@ public enum ModelTransport: String, CaseIterable, Codable, Sendable {
     public var requiresEndpoint: Bool { self != .localWorker }
 }
 
+public enum ModelAuthentication: String, Codable, Sendable {
+    case none
+    case bearer
+}
+
 public struct ModelEndpoint: Codable, Equatable, Sendable {
     public let transport: ModelTransport
     public let endpointURL: URL?
     public let modelID: String
+    public let authentication: ModelAuthentication
 
-    public init(transport: ModelTransport, endpointURL: URL?, modelID: String) {
+    public init(
+        transport: ModelTransport,
+        endpointURL: URL?,
+        modelID: String,
+        authentication: ModelAuthentication = .none
+    ) {
         self.transport = transport
         self.endpointURL = endpointURL
         self.modelID = modelID
+        self.authentication = transport == .localWorker ? .none : authentication
     }
 
     /// Persisted derivations must change when the same model name is served by
@@ -54,6 +66,33 @@ public struct ModelEndpoint: Codable, Equatable, Sendable {
             .map { String(format: "%02x", $0) }
             .joined()
         return "\(modelID)@\(suffix)"
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case transport
+        case endpointURL
+        case modelID
+        case authentication
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        transport = try container.decode(ModelTransport.self, forKey: .transport)
+        endpointURL = try container.decodeIfPresent(URL.self, forKey: .endpointURL)
+        modelID = try container.decode(String.self, forKey: .modelID)
+        if transport == .localWorker {
+            authentication = .none
+        } else if let saved = try container.decodeIfPresent(
+            ModelAuthentication.self,
+            forKey: .authentication
+        ) {
+            authentication = saved
+        } else {
+            // Schema 1/2 had no explicit authentication mode. Preserve likely
+            // remote Bearer setups while ensuring local no-auth services never
+            // cause a Keychain read merely because the app launched.
+            authentication = endpointURL?.isLoopbackHost == true ? .none : .bearer
+        }
     }
 }
 
@@ -90,7 +129,7 @@ public struct ModelConfiguration: Codable, Equatable, Sendable {
         }
     }
 
-    public static let currentSchemaVersion = 2
+    public static let currentSchemaVersion = 3
 
     public let schemaVersion: Int
     public let asr: ModelEndpoint
@@ -116,6 +155,10 @@ public struct ModelConfiguration: Codable, Equatable, Sendable {
 
     public var usesLocalWorker: Bool {
         aligner.transport == .localWorker || embedding.transport == .localWorker
+    }
+
+    public var credentialRoles: Set<ModelRole> {
+        Set(ModelRole.allCases.filter { endpoint(for: $0).authentication == .bearer })
     }
 
     public var omlx: OMLX {
@@ -146,13 +189,16 @@ public struct ModelConfiguration: Codable, Equatable, Sendable {
         )
     }
 
-    /// Source compatibility for schema-1 callers. Encoding always writes v2.
+    /// Source compatibility for schema-1 callers. Encoding always writes the
+    /// current schema.
     public init(schemaVersion _: Int, omlx: OMLX, worker: Worker) {
+        let authentication: ModelAuthentication = omlx.baseURL.isLoopbackHost ? .none : .bearer
         self.init(
             asr: ModelEndpoint(
                 transport: .openAITranscription,
                 endpointURL: omlx.baseURL.appending(path: "audio/transcriptions"),
-                modelID: omlx.asrModelID
+                modelID: omlx.asrModelID,
+                authentication: authentication
             ),
             aligner: ModelEndpoint(
                 transport: .localWorker,
@@ -167,7 +213,8 @@ public struct ModelConfiguration: Codable, Equatable, Sendable {
             description: ModelEndpoint(
                 transport: .openAIChatCompletion,
                 endpointURL: omlx.baseURL.appending(path: "chat/completions"),
-                modelID: omlx.descriptionModelID
+                modelID: omlx.descriptionModelID,
+                authentication: authentication
             ),
             localWorker: worker
         )
@@ -284,14 +331,17 @@ public struct ModelConfiguration: Codable, Equatable, Sendable {
 
         // Schema 1 was tied to one oMLX HTTP connection plus a direct MLX
         // worker. Decode it in place so existing users keep working, then emit
-        // schema 2 the next time Settings is saved.
+        // the current schema the next time Settings is saved.
         let legacyHTTP = try container.decode(LegacyOMLX.self, forKey: .omlx)
         let legacyWorker = try container.decode(Worker.self, forKey: .worker)
+        let legacyHTTPAuthentication: ModelAuthentication =
+            legacyHTTP.baseURL.isLoopbackHost ? .none : .bearer
         schemaVersion = Self.currentSchemaVersion
         asr = ModelEndpoint(
             transport: .openAITranscription,
             endpointURL: legacyHTTP.baseURL.appending(path: "audio/transcriptions"),
-            modelID: legacyHTTP.asrModelID
+            modelID: legacyHTTP.asrModelID,
+            authentication: legacyHTTPAuthentication
         )
         aligner = ModelEndpoint(
             transport: .localWorker,
@@ -306,7 +356,8 @@ public struct ModelConfiguration: Codable, Equatable, Sendable {
         description = ModelEndpoint(
             transport: .openAIChatCompletion,
             endpointURL: legacyHTTP.baseURL.appending(path: "chat/completions"),
-            modelID: legacyHTTP.descriptionModelID
+            modelID: legacyHTTP.descriptionModelID,
+            authentication: legacyHTTPAuthentication
         )
         localWorker = legacyWorker
     }
@@ -365,5 +416,12 @@ extension ModelConfigurationError: LocalizedError {
         case .missingLocalWorker:
             "本地 Worker 的启动器或模型目录没有配置完整。"
         }
+    }
+}
+
+private extension URL {
+    var isLoopbackHost: Bool {
+        guard let host = host?.lowercased() else { return false }
+        return host == "localhost" || host == "127.0.0.1" || host == "::1"
     }
 }
