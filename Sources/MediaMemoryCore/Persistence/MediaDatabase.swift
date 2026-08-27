@@ -6,7 +6,7 @@ public enum MediaDatabaseOpenError: Error, LocalizedError, Equatable, Sendable {
     public var errorDescription: String? {
         switch self {
         case let .unsupportedSchemaVersion(version):
-            "数据库版本 \(version) 高于当前应用支持的版本 8，请使用更新版本的 Media Memory。"
+            "数据库版本 \(version) 高于当前应用支持的版本 9，请使用更新版本的 Media Memory。"
         }
     }
 }
@@ -434,9 +434,10 @@ public actor MediaDatabase {
         )
         let assetID = existing?.id ?? UUID().uuidString
         let firstSeenAt = existing?.firstSeenAt ?? seenAt
-        let needsNewSegments = existing == nil
-            || existing?.fingerprint != asset.fingerprint
-            || existing?.durationMS != asset.durationMS
+        // 时长是探测产物而非内容身份：只有指纹变化（或缺失段）才直接重建；
+        // 同指纹下的时长漂移走覆盖锚定判定，绝不先删可用语义代际。
+        let contentChanged = existing == nil || existing?.fingerprint != asset.fingerprint
+        let needsNewSegments = contentChanged
             || (asset.status == .ready && existing?.segmentCount == 0)
 
         if needsNewSegments, existing != nil, !(try isExcluded(assetID: assetID)) {
@@ -445,14 +446,32 @@ public actor MediaDatabase {
             _ = try delete.step()
         }
 
+        // 同指纹时长漂移：探测值与当前活动代际覆盖的偏差在容差内视为
+        // 探测抖动，仅更新权威字段；超出容差则挂起候选值并保持权威时长
+        // 与现有覆盖一致，由语义分片旁路新代际修正、激活时一并落定。
+        var authoritativeDurationMS = asset.durationMS
+        var candidateDurationMS: Int64?
+        if !contentChanged,
+           asset.status == .ready,
+           existing?.durationMS != asset.durationMS {
+            let coverageEndMS = try lastActiveSegmentEndMS(assetID: assetID)
+            if coverageEndMS == 0
+                || abs(asset.durationMS - coverageEndMS) <= TimelineDriftPolicy.toleranceMS {
+                authoritativeDurationMS = asset.durationMS
+            } else {
+                authoritativeDurationMS = existing?.durationMS ?? asset.durationMS
+                candidateDurationMS = asset.durationMS
+            }
+        }
+
         let statement = try connection.prepare(
             """
             INSERT INTO media_asset (
                 id, root_id, relative_path, standardized_path, file_identifier,
                 file_size, modification_time, duration_ms, video_track_count,
                 audio_track_count, is_playable, fingerprint, status, error_message,
-                first_seen_at, last_seen_at, invalidated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                first_seen_at, last_seen_at, invalidated_at, candidate_duration_ms
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
             ON CONFLICT(id) DO UPDATE SET
                 root_id = excluded.root_id,
                 relative_path = excluded.relative_path,
@@ -468,7 +487,8 @@ public actor MediaDatabase {
                 status = excluded.status,
                 error_message = excluded.error_message,
                 last_seen_at = excluded.last_seen_at,
-                invalidated_at = NULL
+                invalidated_at = NULL,
+                candidate_duration_ms = excluded.candidate_duration_ms
             """
         )
         let values: [SQLiteValue] = [
@@ -479,7 +499,7 @@ public actor MediaDatabase {
             asset.fileIdentifier.map(SQLiteValue.text) ?? .null,
             .integer(asset.fileSize),
             .real(asset.modificationDate.timeIntervalSince1970),
-            .integer(asset.durationMS),
+            .integer(authoritativeDurationMS),
             .integer(Int64(asset.videoTrackCount)),
             .integer(Int64(asset.audioTrackCount)),
             .integer(asset.isPlayable ? 1 : 0),
@@ -487,7 +507,8 @@ public actor MediaDatabase {
             .text(asset.status.rawValue),
             asset.errorMessage.map(SQLiteValue.text) ?? .null,
             .real(firstSeenAt.timeIntervalSince1970),
-            .real(seenAt.timeIntervalSince1970)
+            .real(seenAt.timeIntervalSince1970),
+            candidateDurationMS.map(SQLiteValue.integer) ?? .null
         ]
         for (offset, value) in values.enumerated() {
             try statement.bind(value, at: Int32(offset + 1))
@@ -496,8 +517,21 @@ public actor MediaDatabase {
 
         if needsNewSegments, asset.status == .ready, asset.durationMS > 0,
            !(try isExcluded(assetID: assetID)) {
-            try createLegacyFallbackSegments(assetID: assetID, durationMS: asset.durationMS)
+            try createLegacyFallbackSegments(assetID: assetID, durationMS: authoritativeDurationMS)
         }
+    }
+
+    private func lastActiveSegmentEndMS(assetID: String) throws -> Int64 {
+        let statement = try connection.prepare(
+            """
+            SELECT coalesce(max(end_ms), 0)
+            FROM segment
+            WHERE asset_id = ? AND is_active = 1
+            """
+        )
+        try statement.bind(.text(assetID), at: 1)
+        guard try statement.step() else { return 0 }
+        return statement.integer(at: 0)
     }
 
     private func isExcluded(assetID: String) throws -> Bool {
@@ -742,7 +776,7 @@ public actor MediaDatabase {
 
     private static func migrate(_ connection: SQLiteConnection) throws {
         let version = try schemaVersion(connection)
-        guard version <= 8 else {
+        guard version <= 9 else {
             throw MediaDatabaseOpenError.unsupportedSchemaVersion(version)
         }
         try connection.execute("PRAGMA foreign_keys = ON")
@@ -777,6 +811,7 @@ public actor MediaDatabase {
                 first_seen_at REAL NOT NULL,
                 last_seen_at REAL NOT NULL,
                 invalidated_at REAL,
+                candidate_duration_ms INTEGER,
                 UNIQUE(root_id, relative_path)
             );
             CREATE INDEX IF NOT EXISTS media_asset_root_file_id
@@ -930,7 +965,7 @@ public actor MediaDatabase {
 
             """
         )
-        if version < 8 {
+        if version < 9 {
             // DDL 与版本号必须一起提交。列存在检查也让曾在旧实现中断于
             // ALTER TABLE 与 user_version 之间的数据库可以安全恢复。
             try connection.inTransaction {
@@ -990,6 +1025,20 @@ public actor MediaDatabase {
                     // 组合身份。实际数据迁移需要当前模型配置，因此由 App
                     // 在只读连接和后台车道启动前完成并写入迁移标记。
                     try connection.execute("PRAGMA user_version = 8")
+                }
+                if version < 9 {
+                    // 时长探测漂移修正：候选时长先挂起在资产行上，由语义
+                    // 分片旁路新代际确认，激活事务内才落定为权威时长。
+                    if !(try columnExists(
+                        connection,
+                        table: "media_asset",
+                        column: "candidate_duration_ms"
+                    )) {
+                        try connection.execute(
+                            "ALTER TABLE media_asset ADD COLUMN candidate_duration_ms INTEGER"
+                        )
+                    }
+                    try connection.execute("PRAGMA user_version = 9")
                 }
             }
         }

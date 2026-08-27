@@ -40,7 +40,10 @@ public actor DescriptionQueue {
         return try await prepareQueue()
     }
 
-    public func runUntilIdle(onEvent: EventHandler? = nil) async throws -> IndexRunSummary {
+    public func runUntilIdle(
+        onEvent: EventHandler? = nil,
+        onSourceUnavailable: SourceUnavailableHandler? = nil
+    ) async throws -> IndexRunSummary {
         _ = try await prepareQueue()
         var succeeded = 0
         var failed = 0
@@ -68,6 +71,26 @@ public actor DescriptionQueue {
             } catch is CancellationError {
                 try await returnToQueue(target.job.claimToken)
                 throw CancellationError()
+            } catch let unavailable as SourceUnavailableError {
+                // 通知必须 await：断路状态要先于车道收尾落地，否则收尾的
+                // 重启逻辑会在断路生效前把车道再拉起一次。
+                switch await resolveSourceDisposition(onSourceUnavailable, unavailable) {
+                case .park:
+                    try await returnToQueue(
+                        target.job.claimToken,
+                        stage: "source_unavailable"
+                    )
+                    break laneLoop
+                case .failJob:
+                    if try await fail(
+                        target.job.claimToken,
+                        message: unavailable.localizedDescription
+                    ) {
+                        failed += 1
+                        await publish(target: target, stage: "describe_failed", onEvent: onEvent)
+                    }
+                    continue laneLoop
+                }
             } catch MediaDatabaseDerivationError.descriptionInputChanged {
                 try await returnToQueue(
                     target.job.claimToken,

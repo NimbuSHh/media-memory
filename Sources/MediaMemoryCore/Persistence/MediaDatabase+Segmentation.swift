@@ -49,20 +49,23 @@ extension MediaDatabase {
                     )
                   )
                   AND asset_id IN (
-                    SELECT a.id
-                    FROM media_asset a
-                    WHERE a.status = 'ready'
-                      AND a.invalidated_at IS NULL
-                      AND a.is_excluded = 0
-                      AND NOT EXISTS (
-                        SELECT 1
-                        FROM derivation_run r
-                        WHERE r.asset_id = a.id
-                          AND r.kind = 'segmentation'
-                          AND r.source_fingerprint = a.fingerprint
-                          AND json_extract(r.parameters_json, '$.algorithm_version') = ?
-                          AND r.status IN ('running', 'succeeded')
-                      )
+                      SELECT a.id
+                      FROM media_asset a
+                      WHERE a.status = 'ready'
+                        AND a.invalidated_at IS NULL
+                        AND a.is_excluded = 0
+                        AND (
+                            a.candidate_duration_ms IS NOT NULL
+                            OR NOT EXISTS (
+                                SELECT 1
+                                FROM derivation_run r
+                                WHERE r.asset_id = a.id
+                                  AND r.kind = 'segmentation'
+                                  AND r.source_fingerprint = a.fingerprint
+                                  AND json_extract(r.parameters_json, '$.algorithm_version') = ?
+                                  AND r.status IN ('running', 'succeeded')
+                            )
+                        )
                   )
                 """
             )
@@ -97,14 +100,17 @@ extension MediaDatabase {
                   AND a.invalidated_at IS NULL
                   AND a.is_excluded = 0
                   AND j.id IS NULL
-                  AND NOT EXISTS (
-                    SELECT 1
-                    FROM derivation_run r
-                    WHERE r.asset_id = a.id
-                      AND r.kind = 'segmentation'
-                      AND r.source_fingerprint = a.fingerprint
-                      AND json_extract(r.parameters_json, '$.algorithm_version') = ?
-                      AND r.status IN ('running', 'succeeded')
+                  AND (
+                      a.candidate_duration_ms IS NOT NULL
+                      OR NOT EXISTS (
+                          SELECT 1
+                          FROM derivation_run r
+                          WHERE r.asset_id = a.id
+                            AND r.kind = 'segmentation'
+                            AND r.source_fingerprint = a.fingerprint
+                            AND json_extract(r.parameters_json, '$.algorithm_version') = ?
+                            AND r.status IN ('running', 'succeeded')
+                      )
                   )
                 """
             )
@@ -193,7 +199,7 @@ extension MediaDatabase {
                        a.file_size, a.modification_time, a.duration_ms,
                        a.video_track_count, a.audio_track_count, a.is_playable,
                        a.fingerprint, a.status, a.error_message,
-                       a.first_seen_at, a.last_seen_at
+                       a.first_seen_at, a.last_seen_at, a.candidate_duration_ms
                 FROM job j
                 JOIN media_asset a ON a.id = j.asset_id
                 WHERE j.kind = 'segment_asset'
@@ -212,6 +218,7 @@ extension MediaDatabase {
                   let asset = segmentationAsset(from: query, offset: 3) else {
                 return .idle
             }
+            let candidateDuration = query.integer(at: 18)
             let attempt = Int(query.integer(at: 1)) + 1
             let createdAt = Date(timeIntervalSince1970: query.real(at: 2))
             let update = try connection.prepare(
@@ -242,7 +249,8 @@ extension MediaDatabase {
                         createdAt: createdAt,
                         updatedAt: now
                     ),
-                    asset: asset
+                    asset: asset,
+                    candidateDurationMS: candidateDuration > 0 ? candidateDuration : nil
                 )
             )
         }
@@ -325,6 +333,8 @@ extension MediaDatabase {
 
     /// Stores a new semantic generation beside the currently active segments.
     /// Existing searchable data remains active until every new segment has an embedding.
+    /// `candidateDurationMS` 携带同指纹时长漂移的确认值：暂存进 run 参数，
+    /// 激活事务内才落定为权威时长；提交本身只清除挂起标记，不提前覆盖。
     public func commitSegmentation(
         claim: JobClaimToken,
         assetID: String,
@@ -333,6 +343,7 @@ extension MediaDatabase {
         parametersJSON: String,
         segments: [SemanticSegmentDraft],
         observations: [TimelineBoundaryObservationDraft] = [],
+        candidateDurationMS: Int64? = nil,
         now: Date = Date()
     ) throws {
         try validateSegmentation(segments, assetID: assetID)
@@ -354,9 +365,10 @@ extension MediaDatabase {
             try assetQuery.bind(.text(assetID), at: 3)
             try assetQuery.bind(.text(sourceFingerprint), at: 4)
             guard try assetQuery.step() else { throw SegmentationDatabaseError.missingAsset }
-            let durationMS = assetQuery.integer(at: 0)
+            let storedDurationMS = assetQuery.integer(at: 0)
+            let authoritativeDurationMS = candidateDurationMS ?? storedDurationMS
             guard segments.first?.startMS == 0,
-                  segments.last?.endMS == durationMS else {
+                  segments.last?.endMS == authoritativeDurationMS else {
                 throw SegmentationDatabaseError.invalidCoverage
             }
 
@@ -432,6 +444,11 @@ extension MediaDatabase {
             _ = try deleteRetiredRuns.step()
 
             let runID = UUID().uuidString
+            let runParametersJSON = Self.runParameters(
+                parametersJSON,
+                candidateDurationMS: candidateDurationMS,
+                authoritativeDurationMS: storedDurationMS
+            )
             let run = try connection.prepare(
                 """
                 INSERT INTO derivation_run (
@@ -444,13 +461,21 @@ extension MediaDatabase {
             try run.bind(.text(runID), at: 1)
             try run.bind(.text(assetID), at: 2)
             try run.bind(.text(algorithmVersion), at: 3)
-            try run.bind(.text(parametersJSON), at: 4)
+            try run.bind(.text(runParametersJSON), at: 4)
             try run.bind(.text(sourceFingerprint), at: 5)
             try run.bind(.real(now.timeIntervalSince1970), at: 6)
             _ = try run.step()
 
+            // 候选已随本次提交进入 run 参数；挂起标记必须同时清除，否则
+            // reconcile 会无限重置该任务。
+            let clearCandidate = try connection.prepare(
+                "UPDATE media_asset SET candidate_duration_ms = NULL WHERE id = ?"
+            )
+            try clearCandidate.bind(.text(assetID), at: 1)
+            _ = try clearCandidate.step()
+
             for (index, observation) in observations.enumerated()
-            where observation.timeMS >= 0 && observation.timeMS <= durationMS {
+            where observation.timeMS >= 0 && observation.timeMS <= authoritativeDurationMS {
                 let insert = try connection.prepare(
                     """
                     INSERT INTO timeline_boundary_observation (
@@ -484,7 +509,10 @@ extension MediaDatabase {
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, 0)
                     """
                 )
-                let segmentID = "\(assetID):\(algorithmVersion):\(value.startMS):\(value.endMS)"
+                // 段 ID 必须含 runID：同一算法版本的时长漂移修正会与仍服役的
+                // 旧 ACTIVE 代际并行存在，仅凭算法版本+边界无法区分两代，
+                // 相同边界（典型如尾部前的一段）会主键冲突。
+                let segmentID = "\(assetID):\(runID):\(value.startMS):\(value.endMS)"
                 try insert.bind(.text(segmentID), at: 1)
                 try insert.bind(.text(assetID), at: 2)
                 try insert.bind(.integer(Int64(ordinal)), at: 3)
@@ -546,6 +574,46 @@ extension MediaDatabase {
             try finish.bind(.text(claim.jobID), at: 3)
             try finish.bind(.integer(Int64(claim.attemptCount)), at: 4)
             guard try finish.step() else { throw SegmentationDatabaseError.staleClaim }
+        }
+    }
+
+    /// 探测漂移被解码时长判为误报时的完成入口：不旁路新代际，
+    /// 清掉挂起候选并正常结任务；现有活动代际与权威时长保持不变。
+    public func dismissSegmentationDurationCandidate(
+        claim: JobClaimToken,
+        now: Date = Date()
+    ) throws {
+        try connection.inTransaction {
+            let finish = try connection.prepare(
+                """
+                UPDATE job
+                SET status = 'succeeded', checkpoint_json = ?,
+                    error_message = NULL, updated_at = ?
+                WHERE id = ? AND kind = 'segment_asset'
+                  AND status = 'running' AND attempt_count = ?
+                RETURNING asset_id
+                """
+            )
+            try finish.bind(
+                .text(segmentationCheckpoint(
+                    stage: "duration_drift_dismissed",
+                    algorithmVersion: nil,
+                    sourceFingerprint: nil
+                )),
+                at: 1
+            )
+            try finish.bind(.real(now.timeIntervalSince1970), at: 2)
+            try finish.bind(.text(claim.jobID), at: 3)
+            try finish.bind(.integer(Int64(claim.attemptCount)), at: 4)
+            guard try finish.step(),
+                  let assetID = finish.text(at: 0) else {
+                throw SegmentationDatabaseError.staleClaim
+            }
+            let clear = try connection.prepare(
+                "UPDATE media_asset SET candidate_duration_ms = NULL WHERE id = ?"
+            )
+            try clear.bind(.text(assetID), at: 1)
+            _ = try clear.step()
         }
     }
 
@@ -706,6 +774,34 @@ extension MediaDatabase {
         try complete.bind(.text(assetID), at: 3)
         _ = try complete.step()
 
+        // 漂移修正代际激活：候选时长与活动代际在同一事务内落定，旧代际
+        // 服役期间权威时长始终与其覆盖一致。
+        let candidateQuery = try connection.prepare(
+            """
+            SELECT json_extract(parameters_json, '$.candidate_duration_ms')
+            FROM derivation_run
+            WHERE id = ? AND asset_id = ? AND kind = 'segmentation'
+              AND status = 'succeeded' AND json_valid(parameters_json)
+            """
+        )
+        try candidateQuery.bind(.text(runID), at: 1)
+        try candidateQuery.bind(.text(assetID), at: 2)
+        if try candidateQuery.step() {
+            let candidateMS = candidateQuery.integer(at: 0)
+            if candidateMS > 0 {
+                let apply = try connection.prepare(
+                    """
+                    UPDATE media_asset
+                    SET duration_ms = ?, candidate_duration_ms = NULL
+                    WHERE id = ?
+                    """
+                )
+                try apply.bind(.integer(candidateMS), at: 1)
+                try apply.bind(.text(assetID), at: 2)
+                _ = try apply.step()
+            }
+        }
+
         // Keep exactly the generation that was active immediately before this
         // switch. A newer cancelled/failed staged generation must never evict
         // the real rollback generation merely because its version is larger.
@@ -783,6 +879,27 @@ extension MediaDatabase {
         guard cursor > 0, !assetID.isEmpty else {
             throw SegmentationDatabaseError.invalidCoverage
         }
+    }
+
+    private static func runParameters(
+        _ parametersJSON: String,
+        candidateDurationMS: Int64?,
+        authoritativeDurationMS: Int64
+    ) -> String {
+        guard let candidateDurationMS, candidateDurationMS != authoritativeDurationMS else {
+            return parametersJSON
+        }
+        guard var object = try? JSONSerialization.jsonObject(
+            with: Data(parametersJSON.utf8)
+        ) as? [String: Any] else {
+            return "{\"candidate_duration_ms\":\(candidateDurationMS)}"
+        }
+        object["candidate_duration_ms"] = candidateDurationMS
+        guard let data = try? JSONSerialization.data(
+            withJSONObject: object,
+            options: [.sortedKeys]
+        ) else { return parametersJSON }
+        return String(decoding: data, as: UTF8.self)
     }
 
     private func segmentationCheckpoint(

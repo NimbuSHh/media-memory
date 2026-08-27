@@ -100,6 +100,26 @@ public struct AssetSegmentationJobRecord: Equatable, Sendable {
 public struct AssetSegmentationTarget: Equatable, Sendable {
     public let job: AssetSegmentationJobRecord
     public let asset: MediaAssetRecord
+    /// 扫描挂起、待语义分片确认的候选时长（同指纹时长漂移超出容差时存在）。
+    public let candidateDurationMS: Int64?
+
+    public init(
+        job: AssetSegmentationJobRecord,
+        asset: MediaAssetRecord,
+        candidateDurationMS: Int64? = nil
+    ) {
+        self.job = job
+        self.asset = asset
+        self.candidateDurationMS = candidateDurationMS
+    }
+}
+
+/// 探测时长与活动代际覆盖比较的统一容差：偏差不超过该值视为探测抖动，
+/// 只更新权威字段、不动分片代际；超过则挂起候选值进入旁路修正流程。
+/// 值的依据：分片最小长度 4 秒、OCR 观察窗 1 秒，亚秒级覆盖缺口对检索
+/// 不可见；而误判为抖动的代价（尾部永久缺失）远大于走安全旁路的代价。
+public enum TimelineDriftPolicy {
+    public static let toleranceMS: Int64 = 1_000
 }
 
 public enum AssetSegmentationClaim: Equatable, Sendable {
@@ -462,4 +482,24 @@ public struct CachedSegmentDescription: Equatable, Sendable {
     public let promptVersion: String
     public let modelID: String
     public let createdAt: Date
+    /// 生成时的证据 revision 与当前向量 revision 是否一致（遗留缺 revision
+    /// 的行按一致处理，与 reconcile 的收养口径相同）。不一致表示证据已
+    /// 更新、描述待重新生成，供界面标记；生成路径恒为 true。
+    public let isEvidenceCurrent: Bool
+
+    public init(
+        description: SegmentDescription,
+        inputVersion: String,
+        promptVersion: String,
+        modelID: String,
+        createdAt: Date,
+        isEvidenceCurrent: Bool = true
+    ) {
+        self.description = description
+        self.inputVersion = inputVersion
+        self.promptVersion = promptVersion
+        self.modelID = modelID
+        self.createdAt = createdAt
+        self.isEvidenceCurrent = isEvidenceCurrent
+    }
 }

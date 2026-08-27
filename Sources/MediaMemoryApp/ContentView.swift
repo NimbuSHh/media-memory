@@ -106,34 +106,15 @@ struct ContentView: View {
     private var sidebar: some View {
         List(selection: $model.selectedRootID) {
             Section("媒体库") {
-                Label("全部视频", systemImage: "rectangle.stack")
-                    .tag(String?.none)
+                // 全部视频的统计只列数字；整体处理进度由左下角队列面板展示，
+                // 避免同一列里出现两条相同的总进度条。
+                VStack(alignment: .leading, spacing: 3) {
+                    Label("全部视频", systemImage: "rectangle.stack")
+                    rootStatsCaption(model.libraryStatistics)
+                }
+                .tag(String?.none)
                 ForEach(model.roots) { root in
-                    VStack(alignment: .leading, spacing: 3) {
-                        Label(
-                            root.name,
-                            systemImage: root.kind == .directory
-                                ? "folder" : "doc.movie"
-                        )
-                        if let lastScanAt = root.lastScanAt {
-                            Text("扫描于 \(lastScanAt.formatted(date: .abbreviated, time: .shortened))")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-                    .tag(Optional(root.id))
-                    .contextMenu {
-                        Button("重新扫描\(root.kind == .directory ? "此目录" : "此文件")") {
-                            model.rescanRoot(root)
-                        }
-                        Button("重新授权") {
-                            reauthorize(root)
-                        }
-                        Divider()
-                        Button("从媒体库移除", role: .destructive) {
-                            pendingRootRemoval = root
-                        }
-                    }
+                    rootRow(root)
                 }
             }
         }
@@ -263,6 +244,95 @@ struct ContentView: View {
         .navigationSplitViewColumnWidth(min: 200, ideal: 230, max: 280)
     }
 
+    /// 侧栏路径行：名称、统计（视频数/大小/时长）、整体处理进度与上次扫描时间。
+    private func rootRow(_ root: LibraryRootRecord) -> some View {
+        let stats = model.rootStatistics[root.id]
+        return VStack(alignment: .leading, spacing: 3) {
+            Label(
+                root.name,
+                systemImage: root.kind == .directory
+                    ? "folder" : "doc.movie"
+            )
+            rootStatsCaption(stats)
+            rootProcessingLine(stats?.queue)
+            if let lastScanAt = root.lastScanAt {
+                Text("扫描于 \(lastScanAt.formatted(date: .abbreviated, time: .shortened))")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .tag(Optional(root.id))
+        .contextMenu {
+            Button("重新扫描\(root.kind == .directory ? "此目录" : "此文件")") {
+                model.rescanRoot(root)
+            }
+            Button("重新授权") {
+                reauthorize(root)
+            }
+            Divider()
+            Button("从媒体库移除", role: .destructive) {
+                pendingRootRemoval = root
+            }
+        }
+    }
+
+    /// 统计行：视频数 · 总大小 · 总时长（时长未知时省略）。
+    @ViewBuilder
+    private func rootStatsCaption(_ stats: RootLibraryStatistics?) -> some View {
+        if let stats, stats.videoCount > 0 {
+            Text(rootStatsText(stats))
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+        } else {
+            Text("尚无视频")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private func rootStatsText(_ stats: RootLibraryStatistics) -> String {
+        var parts: [String] = [
+            "\(stats.videoCount) 个视频",
+            ByteCountFormatter.string(fromByteCount: stats.totalFileSize, countStyle: .file)
+        ]
+        if stats.totalDurationMS > 0 {
+            parts.append(formatDuration(stats.totalDurationMS))
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    /// 该路径的整体处理进度：全部完成时显示对勾，
+    /// 否则显示细进度条与完成计数（处理中/失败仅在非零时附加）。
+    @ViewBuilder
+    private func rootProcessingLine(_ queue: VideoQueueSummary?) -> some View {
+        if let queue, queue.total > 0 {
+            Group {
+                if queue.completed == queue.total, queue.failed == 0 {
+                    Label("全部完成", systemImage: "checkmark.circle.fill")
+                        .foregroundStyle(.green)
+                } else {
+                    HStack(spacing: 6) {
+                        ProgressView(value: queue.completedFraction)
+                            .frame(width: 44)
+                        Text("\(queue.completed)/\(queue.total)")
+                        if queue.inProgress > 0 {
+                            Text("处理中 \(queue.inProgress)")
+                                .foregroundStyle(.blue)
+                        }
+                        if queue.failed > 0 {
+                            Text("失败 \(queue.failed)")
+                                .foregroundStyle(.orange)
+                        }
+                    }
+                    .foregroundStyle(.secondary)
+                }
+            }
+            .font(.caption2.monospacedDigit())
+            .allowsHitTesting(false)
+        }
+    }
+
     private func statusLine(_ text: String, active: Bool) -> some View {
         HStack(spacing: 8) {
             if active {
@@ -349,6 +419,12 @@ struct ContentView: View {
                             HStack {
                                 Text(warning.title).font(.callout.weight(.medium))
                                 Spacer()
+                                if warning.id.hasPrefix("source.") {
+                                    Button("重试读取源") {
+                                        model.retrySourceCircuits()
+                                    }
+                                    .buttonStyle(.borderless)
+                                }
                                 Button("清除") {
                                     model.dismissBackgroundWarning(warning)
                                 }
@@ -867,13 +943,6 @@ struct ContentView: View {
         .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 10))
     }
 
-    @ViewBuilder
-    private var descriptionSection: some View {
-        if let segmentID = model.selectedResult?.segment.id {
-            descriptionSection(for: segmentID, describeStatus: nil)
-        }
-    }
-
     /// 描述在建库后由描述车道自动批量生成；这里只展示结果或队列状态。
     private func descriptionSection(
         for segmentID: String,
@@ -891,7 +960,11 @@ struct ContentView: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
             if let display = model.segmentDescriptions[segmentID] {
-                SegmentDescriptionContent(cached: display.cached, isStale: display.isStale)
+                SegmentDescriptionContent(
+                    cached: display.cached,
+                    isConfigStale: display.isConfigStale,
+                    isEvidenceStale: display.isEvidenceStale
+                )
             } else {
                 Text(descriptionQueueText(describeStatus))
                     .font(.callout)
@@ -907,7 +980,7 @@ struct ContentView: View {
         case .running: "正在生成描述…"
         case .pending: "描述排队中，生成后会自动出现。"
         case .failed, .cancelled: "描述生成失败，可稍后在左下角重试。"
-        case .succeeded: "描述生成中…"
+        case .succeeded: "描述已生成，结果即将显示…"
         case nil: "描述还在后台队列中，生成后会自动出现。"
         }
     }
@@ -1436,7 +1509,8 @@ private actor FrameThumbnailLoader {
 /// 语音与画面文字不在这里展示——它们是证据，由 ASR/OCR 证据区展示。
 private struct SegmentDescriptionContent: View {
     let cached: CachedSegmentDescription
-    let isStale: Bool
+    let isConfigStale: Bool
+    let isEvidenceStale: Bool
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -1454,8 +1528,13 @@ private struct SegmentDescriptionContent: View {
                 }
             }
             HStack(spacing: 8) {
-                if isStale {
+                if isConfigStale {
                     Label("旧版提示词/模型生成，可重新生成", systemImage: "clock.arrow.circlepath")
+                        .foregroundStyle(.orange)
+                }
+                if isEvidenceStale {
+                    // 数据性过期由后台自动重跑；标记只覆盖等待窗口。
+                    Label("证据已更新，描述待重新生成", systemImage: "arrow.triangle.2.circlepath")
                         .foregroundStyle(.orange)
                 }
                 Text("生成于 \(cached.createdAt.formatted(date: .abbreviated, time: .shortened))")

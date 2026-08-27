@@ -81,7 +81,7 @@ final class ScanConsistencyTests: XCTestCase {
         let inspection = try SQLiteConnection(url: url)
         let version = try inspection.prepare("PRAGMA user_version")
         XCTAssertTrue(try version.step())
-        XCTAssertEqual(version.integer(at: 0), 8)
+        XCTAssertEqual(version.integer(at: 0), 9)
         let active = try inspection.prepare(
             "SELECT is_active, segmentation_run_id FROM segment WHERE id = 'segment-v6'"
         )

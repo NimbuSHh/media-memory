@@ -168,7 +168,25 @@ public actor LocalSourceCache {
         }
         try removeAllFiles()
         entry = nil
+        // 源访问段（授权、源读取与复制）统一归一化：除取消与本地缓存自身的
+        // 已知错误外，任何失败都按“整个源暂时不可访问”上报，由应用层决定
+        // 停车；单视频自身问题（内容变化、缓存校验、本地容量）不在此列。
+        do {
+            let url = try await copySourceThroughCache(asset)
+            return url
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch let error as LocalSourceCacheError {
+            throw error
+        } catch let error as SourceUnavailableError {
+            throw error
+        } catch {
+            throw SourceUnavailableError(rootID: asset.rootID, underlying: error)
+        }
+    }
 
+    /// 从源复制并校验；失败由调用方在源缓存边界归一化为源不可用。
+    private func copySourceThroughCache(_ asset: MediaAssetRecord) async throws -> URL {
         // Resolving a security-scoped bookmark may wake an offline NAS. Do it
         // only when a processing lane actually needs to materialize this source.
         try await authorizeSource(asset)

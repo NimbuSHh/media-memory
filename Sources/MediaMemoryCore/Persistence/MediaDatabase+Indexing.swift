@@ -1667,10 +1667,12 @@ extension MediaDatabase {
         try statement.bind(.text(segmentID), at: 1)
         try statement.bind(.text(inputVersion), at: 2)
         guard try statement.step(), let json = statement.text(at: 0) else { return nil }
-        let description = try JSONDecoder().decode(
+        // 单条损坏的缓存 JSON 不抛错：按"无缓存"处理走重新生成，
+        // 提交时 upsert 覆盖坏行，实现自愈。
+        guard let description = try? JSONDecoder().decode(
             SegmentDescription.self,
             from: Data(json.utf8)
-        )
+        ) else { return nil }
         return CachedSegmentDescription(
             description: description,
             inputVersion: statement.text(at: 1) ?? inputVersion,
@@ -1681,13 +1683,20 @@ extension MediaDatabase {
     }
 
     /// 展示用：片段最新一份缓存描述（无论 input/prompt/模型版本是否当前）。
+    /// 附带证据 revision 是否仍与当前向量一致，供界面标记数据性过期。
     public func latestDescription(segmentID: String) throws -> CachedSegmentDescription? {
         let statement = try connection.prepare(
             """
-            SELECT description_json, input_version, created_at, d.prompt_version,
-                   coalesce(r.model_id, '')
+            SELECT description_json, d.input_version, d.created_at, d.prompt_version,
+                   coalesce(r.model_id, ''),
+                   e.derivation_run_id IS NOT NULL
+                   AND coalesce(
+                       json_extract(r.parameters_json, '$.input_revision'),
+                       e.derivation_run_id
+                   ) = e.derivation_run_id
             FROM segment_description d
             LEFT JOIN derivation_run r ON r.id = d.derivation_run_id
+            LEFT JOIN segment_embedding e ON e.segment_id = d.segment_id
             WHERE d.segment_id = ?
             ORDER BY d.created_at DESC
             LIMIT 1
@@ -1695,28 +1704,36 @@ extension MediaDatabase {
         )
         try statement.bind(.text(segmentID), at: 1)
         guard try statement.step(), let json = statement.text(at: 0) else { return nil }
-        let description = try JSONDecoder().decode(
+        guard let description = try? JSONDecoder().decode(
             SegmentDescription.self,
             from: Data(json.utf8)
-        )
+        ) else { return nil }
         return CachedSegmentDescription(
             description: description,
             inputVersion: statement.text(at: 1) ?? "",
             promptVersion: statement.text(at: 3) ?? "",
             modelID: statement.text(at: 4) ?? "",
-            createdAt: Date(timeIntervalSince1970: statement.real(at: 2))
+            createdAt: Date(timeIntervalSince1970: statement.real(at: 2)),
+            isEvidenceCurrent: statement.integer(at: 5) != 0
         )
     }
 
     /// 展示整个视频时一次取回全部片段描述，避免详情页按片段逐条查询。
+    /// 单条损坏的 JSON 只跳过该行，不放大为整页失败。
     public func latestDescriptions(assetID: String) throws -> [String: CachedSegmentDescription] {
         let statement = try connection.prepare(
             """
             SELECT d.segment_id, d.description_json, d.input_version, d.created_at,
-                   d.prompt_version, coalesce(r.model_id, '')
+                   d.prompt_version, coalesce(r.model_id, ''),
+                   e.derivation_run_id IS NOT NULL
+                   AND coalesce(
+                       json_extract(r.parameters_json, '$.input_revision'),
+                       e.derivation_run_id
+                   ) = e.derivation_run_id
             FROM segment_description d
             JOIN segment s ON s.id = d.segment_id
             LEFT JOIN derivation_run r ON r.id = d.derivation_run_id
+            LEFT JOIN segment_embedding e ON e.segment_id = d.segment_id
             WHERE s.asset_id = ? AND s.is_active = 1
             """
         )
@@ -1724,17 +1741,18 @@ extension MediaDatabase {
         var descriptions: [String: CachedSegmentDescription] = [:]
         while try statement.step() {
             guard let segmentID = statement.text(at: 0),
-                  let json = statement.text(at: 1) else { continue }
-            let description = try JSONDecoder().decode(
-                SegmentDescription.self,
-                from: Data(json.utf8)
-            )
+                  let json = statement.text(at: 1),
+                  let description = try? JSONDecoder().decode(
+                      SegmentDescription.self,
+                      from: Data(json.utf8)
+                  ) else { continue }
             descriptions[segmentID] = CachedSegmentDescription(
                 description: description,
                 inputVersion: statement.text(at: 2) ?? "",
                 promptVersion: statement.text(at: 4) ?? "",
                 modelID: statement.text(at: 5) ?? "",
-                createdAt: Date(timeIntervalSince1970: statement.real(at: 3))
+                createdAt: Date(timeIntervalSince1970: statement.real(at: 3)),
+                isEvidenceCurrent: statement.integer(at: 6) != 0
             )
         }
         return descriptions

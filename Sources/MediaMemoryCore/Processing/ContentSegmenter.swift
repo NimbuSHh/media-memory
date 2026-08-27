@@ -111,7 +111,10 @@ public actor ContentSegmenter {
         try await database.segmentationProgress()
     }
 
-    public func runUntilIdle(onEvent: EventHandler? = nil) async throws -> IndexRunSummary {
+    public func runUntilIdle(
+        onEvent: EventHandler? = nil,
+        onSourceUnavailable: SourceUnavailableHandler? = nil
+    ) async throws -> IndexRunSummary {
         _ = try await prepareQueue()
         var succeeded = 0
         var failed = 0
@@ -138,6 +141,29 @@ public actor ContentSegmenter {
                     claim: target.job.claimToken
                 )
                 throw CancellationError()
+            } catch let unavailable as SourceUnavailableError {
+                // 通知必须 await：断路状态要先于车道收尾落地，否则收尾的
+                // 重启逻辑会在断路生效前把车道再拉起一次。
+                switch await resolveSourceDisposition(onSourceUnavailable, unavailable) {
+                case .park:
+                    try? await database.returnSegmentationJobToQueue(
+                        claim: target.job.claimToken,
+                        stage: "source_unavailable"
+                    )
+                    break laneLoop
+                case .failJob:
+                    do {
+                        try await database.failSegmentationJob(
+                            claim: target.job.claimToken,
+                            message: unavailable.localizedDescription
+                        )
+                        failed += 1
+                        await publish(target: target, stage: "failed", onEvent: onEvent)
+                    } catch SegmentationDatabaseError.staleClaim {
+                        // 新一轮认领已接管该任务。
+                    }
+                    continue laneLoop
+                }
             } catch SegmentationDatabaseError.staleClaim {
                 continue
             } catch {
@@ -186,11 +212,35 @@ public actor ContentSegmenter {
         try await stage("planning", target: target, onEvent: onEvent)
         let candidates = features.candidates.compactMap(Self.boundaryCandidate)
         let observations = features.candidates.map(Self.boundaryObservation)
+        // 时长交叉验证：解码得到的 PTS 时长是比容器探测更强的证据。
+        // 候选与解码一致 → 证实漂移；解码与权威值一致 → 候选是探测误报，
+        // 放弃修正、保留现有代际；两者都不同 → 以解码时长为准。
+        let authoritativeDurationMS = target.asset.durationMS
+        let plannedDurationMS: Int64
+        var confirmedCandidateMS: Int64?
+        if let candidateMS = target.candidateDurationMS {
+            let decodedMS = features.durationMS
+            if abs(decodedMS - candidateMS) <= TimelineDriftPolicy.toleranceMS {
+                plannedDurationMS = candidateMS
+                confirmedCandidateMS = candidateMS
+            } else if abs(decodedMS - authoritativeDurationMS) <= TimelineDriftPolicy.toleranceMS {
+                try await database.dismissSegmentationDurationCandidate(
+                    claim: target.job.claimToken
+                )
+                await publish(target: target, stage: "complete", onEvent: onEvent)
+                return
+            } else {
+                plannedDurationMS = decodedMS
+                confirmedCandidateMS = decodedMS
+            }
+        } else {
+            plannedDurationMS = authoritativeDurationMS
+        }
         let planned = planner.plan(
             SemanticSegmentationInput(
-                // The database duration is the authoritative coverage bound.
-                // Detector PTS values are clamped by the planner.
-                durationMS: target.asset.durationMS,
+                // The staged coverage bound. Detector PTS values are clamped
+                // by the planner.
+                durationMS: plannedDurationMS,
                 boundaryCandidates: candidates
             )
         )
@@ -207,7 +257,8 @@ public actor ContentSegmenter {
             algorithmVersion: algorithmVersion,
             parametersJSON: parametersJSON,
             segments: drafts,
-            observations: observations
+            observations: observations,
+            candidateDurationMS: confirmedCandidateMS
         )
         await publish(target: target, stage: "complete", onEvent: onEvent)
     }

@@ -62,10 +62,24 @@ struct VideoQueueSummary: Equatable {
     }
 }
 
-/// 展示用的片段描述：内容 + 是否由旧版 prompt/模型生成。
+/// 侧栏路径统计：视频数、总大小、总时长，加上以视频为单位的处理进度。
+/// 与 `videoQueue` 同一趟汇总产出，共享同一节流刷新节奏。
+struct RootLibraryStatistics: Equatable {
+    var videoCount = 0
+    var totalFileSize: Int64 = 0
+    var totalDurationMS: Int64 = 0
+    var queue = VideoQueueSummary()
+}
+
+/// 展示用的片段描述：内容 + 两类过期标记。
+/// 配置性过期（旧版 prompt/模型）只标记、手动重跑；数据性过期（证据已
+/// 重新提交）由 reconcile 自动重跑，标记覆盖等待窗口。
 struct DisplayedSegmentDescription: Equatable {
     let cached: CachedSegmentDescription
-    let isStale: Bool
+    let isConfigStale: Bool
+    let isEvidenceStale: Bool
+
+    var isStale: Bool { isConfigStale || isEvidenceStale }
 }
 
 enum AppStartupPhase: Equatable {
@@ -119,6 +133,8 @@ final class AppModel: ObservableObject {
     )
     @Published private(set) var processingSummaries: [String: AssetProcessingSummary] = [:]
     @Published private(set) var videoQueue = VideoQueueSummary()
+    @Published private(set) var libraryStatistics = RootLibraryStatistics()
+    @Published private(set) var rootStatistics: [String: RootLibraryStatistics] = [:]
     @Published private(set) var failedJobs: [IndexJobRecord] = []
     @Published private(set) var failureSummaries: [FailedJobSummary] = []
     @Published var selectedRootID: String? {
@@ -199,6 +215,10 @@ final class AppModel: ObservableObject {
     private var isEvidencePaused = false
     private var isDescriptionPaused = false
     private var isBackgroundControlBarrierActive = false
+    /// 源不可用断路的 MainActor 镜像：所有断路变更都经由本类发生，
+    /// 车道启动守卫同步读取它，避免在守卫里跨 actor 等待。
+    private var isSourceCircuitOpen = false
+    private let sourceCircuitBoard = SourceCircuitBoard()
     private var didRecoverInterruptedJobs = false
     private let scanner = MediaScanner()
 
@@ -330,13 +350,15 @@ final class AppModel: ObservableObject {
                   let sourceCache = model.sourceCache,
                   let workRoot = model.workRoot else { return }
             model.isBackgroundControlBarrierActive = true
-            await model.pauseScanAndWait()
-            await model.pauseIndexingAndWait()
-            try await sourceCache.removeAll()
+            // 复位 defer 必须先于任何可抛错步骤安装（与 persistSettings 一致），
+            // 否则失败路径会让屏障永久挡住三条车道。
             defer {
                 model.isBackgroundControlBarrierActive = false
                 model.startIndexing()
             }
+            await model.pauseScanAndWait()
+            await model.pauseIndexingAndWait()
+            try await sourceCache.removeAll()
             try await database.removeLibraryRoot(id: root.id)
             let cleanupWarning: String?
             do {
@@ -367,13 +389,14 @@ final class AppModel: ObservableObject {
                   let sourceCache = model.sourceCache,
                   let workRoot = model.workRoot else { return }
             model.isBackgroundControlBarrierActive = true
-            await model.pauseScanAndWait()
-            await model.pauseIndexingAndWait()
-            try await sourceCache.removeAll()
+            // 同 removeRoot：defer 先于可抛错步骤安装。
             defer {
                 model.isBackgroundControlBarrierActive = false
                 model.startIndexing()
             }
+            await model.pauseScanAndWait()
+            await model.pauseIndexingAndWait()
+            try await sourceCache.removeAll()
             try await database.removeAsset(assetID: asset.id)
             let cleanupWarning: String?
             do {
@@ -431,9 +454,12 @@ final class AppModel: ObservableObject {
     // MARK: 描述手动重跑（prompt/模型变更不再自动触发）
 
     private func displayed(_ cached: CachedSegmentDescription) -> DisplayedSegmentDescription {
-        let isStale = cached.promptVersion != DescriptionService.promptVersion
-            || cached.modelID != configuration?.description.derivationID
-        return DisplayedSegmentDescription(cached: cached, isStale: isStale)
+        DisplayedSegmentDescription(
+            cached: cached,
+            isConfigStale: cached.promptVersion != DescriptionService.promptVersion
+                || cached.modelID != configuration?.description.derivationID,
+            isEvidenceStale: !cached.isEvidenceCurrent
+        )
     }
 
     /// 重跑整个视频的描述（不动证据链）。
@@ -480,6 +506,10 @@ final class AppModel: ObservableObject {
     func reauthorizeRoot(_ root: LibraryRootRecord, using url: URL) {
         runLibraryOperation(status: "正在更新媒体库授权…") { model in
             guard let database = model.database else { return }
+            // 恢复动作开始时捕获断路代际：期间若新一轮源失败重新开路，
+            // 旧的授权结果不得误清它。
+            let circuitGeneration = await model.sourceCircuitBoard
+                .openCircuit(rootID: root.id)?.generation
             let selected = url.standardizedFileURL
             let expected = URL(fileURLWithPath: root.path).standardizedFileURL
             guard selected.path == expected.path else {
@@ -490,6 +520,10 @@ final class AppModel: ObservableObject {
             try await database.updateLibraryRootBookmark(id: root.id, bookmark: bookmark)
             model.scopedLibraries[root.id] = access
             model.clearBackgroundWarning(id: "library.\(root.id)")
+            if let circuitGeneration,
+               await model.clearSourceCircuitIfMatching(rootID: root.id, generation: circuitGeneration) {
+                model.startIndexing()
+            }
             try await model.refreshLibrary()
             model.statusMessage = "已重新授权：\(root.name)"
         }
@@ -510,6 +544,10 @@ final class AppModel: ObservableObject {
     var isDescriptionIndexing: Bool { describeTask != nil }
 
     func startEvidenceProcessing() {
+        guard !isSourceCircuitOpen else {
+            statusMessage = "媒体源不可用：请先恢复该源（重试读取源 / 重新授权 / 重新扫描）"
+            return
+        }
         isEvidencePaused = false
         evidenceLaneFailure = nil
         segmentationLaneFailure = nil
@@ -521,6 +559,10 @@ final class AppModel: ObservableObject {
     }
 
     func startDescriptionProcessing() {
+        guard !isSourceCircuitOpen else {
+            statusMessage = "媒体源不可用：请先恢复该源（重试读取源 / 重新授权 / 重新扫描）"
+            return
+        }
         isDescriptionPaused = false
         descriptionLaneFailure = nil
         clearBackgroundWarning(id: "lane.description")
@@ -1508,33 +1550,77 @@ final class AppModel: ObservableObject {
     ) {
         processingSummaries = summaries
 
-        var queue = VideoQueueSummary()
-        queue.total = assets.count
+        var overall = RootLibraryStatistics()
+        var perRoot: [String: RootLibraryStatistics] = [:]
         for asset in assets {
-            guard let summary = summaries[asset.id] else {
-                queue.notStarted += 1
-                continue
+            var rootStats = perRoot[asset.rootID] ?? RootLibraryStatistics()
+            rootStats.videoCount += 1
+            rootStats.totalFileSize += asset.fileSize
+            rootStats.totalDurationMS += asset.durationMS
+            overall.videoCount += 1
+            overall.totalFileSize += asset.fileSize
+            overall.totalDurationMS += asset.durationMS
+            switch Self.videoQueueBucket(summaries[asset.id]) {
+            case .inProgress:
+                rootStats.queue.inProgress += 1
+                overall.queue.inProgress += 1
+            case .failed:
+                rootStats.queue.failed += 1
+                overall.queue.failed += 1
+            case .waiting:
+                rootStats.queue.waiting += 1
+                overall.queue.waiting += 1
+            case .completed:
+                rootStats.queue.completed += 1
+                overall.queue.completed += 1
+            case .notStarted:
+                rootStats.queue.notStarted += 1
+                overall.queue.notStarted += 1
             }
-            if summary.segmentationStatus == .running
-                || summary.evidenceRunning || summary.describeRunning {
-                queue.inProgress += 1
-            } else if summary.failedCount > 0 {
-                queue.failed += 1
-            } else if summary.segmentationStatus == .pending
-                || summary.evidencePending > 0 || summary.describePending > 0 {
-                queue.waiting += 1
-            } else if summary.totalSegments == 0 {
-                queue.notStarted += 1
-            } else if summary.evidenceSucceeded >= summary.totalSegments,
-                      summary.describeSucceeded >= summary.totalSegments {
-                queue.completed += 1
-            } else {
-                // 车道都空闲但产物不完整（例如描述任务缺队）：
-                // 等待 reconcile 补齐，期间按待处理显示，不误报完成。
-                queue.waiting += 1
-            }
+            perRoot[asset.rootID] = rootStats
         }
-        videoQueue = queue
+        overall.queue.total = assets.count
+        for (rootID, stats) in perRoot {
+            var updated = stats
+            updated.queue.total = updated.videoCount
+            perRoot[rootID] = updated
+        }
+        videoQueue = overall.queue
+        libraryStatistics = overall
+        rootStatistics = perRoot
+    }
+
+    /// 以视频为单位的处理分类，底部队列总览与侧栏路径统计共用，
+    /// 保证同一份数据在两处显示完全一致。
+    private static func videoQueueBucket(
+        _ summary: AssetProcessingSummary?
+    ) -> VideoQueueBucket {
+        guard let summary else { return .notStarted }
+        if summary.segmentationStatus == .running
+            || summary.evidenceRunning || summary.describeRunning {
+            return .inProgress
+        }
+        if summary.failedCount > 0 { return .failed }
+        if summary.segmentationStatus == .pending
+            || summary.evidencePending > 0 || summary.describePending > 0 {
+            return .waiting
+        }
+        guard summary.totalSegments > 0 else { return .notStarted }
+        if summary.evidenceSucceeded >= summary.totalSegments,
+           summary.describeSucceeded >= summary.totalSegments {
+            return .completed
+        }
+        // 车道都空闲但产物不完整（例如描述任务缺队）：
+        // 等待 reconcile 补齐，期间按待处理显示，不误报完成。
+        return .waiting
+    }
+
+    private enum VideoQueueBucket {
+        case inProgress
+        case failed
+        case waiting
+        case completed
+        case notStarted
     }
 
     private func prepareIndexQueue(autoStart: Bool) async throws {
@@ -1564,6 +1650,10 @@ final class AppModel: ObservableObject {
                 try Task.checkCancellation()
                 scanStatusMessage = "正在扫描 \(index + 1)/\(rootsToScan.count)：\(root.name)"
                 do {
+                    // 恢复动作开始时捕获断路代际：扫描期间若新一轮源失败
+                    // 重新开路，本次扫描不得误清它。
+                    let circuitGeneration = await sourceCircuitBoard
+                        .openCircuit(rootID: root.id)?.generation
                     let access: SecurityScopedLibrary
                     if let existing = scopedLibraries[root.id] {
                         access = existing
@@ -1579,6 +1669,13 @@ final class AppModel: ObservableObject {
                     }
                     try Task.checkCancellation()
                     try await database.applyScan(rootID: root.id, result: result)
+                    // 权威重扫成功 = 恢复入口：定向解除该源的断路（代际匹配）。
+                    if let circuitGeneration, result.isAuthoritativeComplete {
+                        await clearSourceCircuitIfMatching(
+                            rootID: root.id,
+                            generation: circuitGeneration
+                        )
+                    }
                     if !result.errors.isEmpty {
                         scanErrors.append(contentsOf: result.errors.prefix(5))
                     }
@@ -1618,6 +1715,7 @@ final class AppModel: ObservableObject {
 
     private func startSegmentationLane() {
         guard !isBackgroundControlBarrierActive,
+              !isSourceCircuitOpen,
               !isEvidencePaused,
               segmentationLaneFailure == nil,
               segmentationTask == nil,
@@ -1633,9 +1731,15 @@ final class AppModel: ObservableObject {
         let generation = segmentationEventGeneration
         segmentationTask = Task(priority: .utility) { [weak self] in
             do {
-                let summary = try await segmenter.runUntilIdle { [weak self] event in
-                    await self?.receiveSegmentation(event, generation: generation)
-                }
+                let summary = try await segmenter.runUntilIdle(
+                    onEvent: { [weak self] event in
+                        await self?.receiveSegmentation(event, generation: generation)
+                    },
+                    onSourceUnavailable: { [weak self] error in
+                        guard let self else { return .park }
+                        return await self.handleSourceUnavailable(error)
+                    }
+                )
                 await self?.finishSegmentationLane(summary: summary, cancelled: false)
             } catch is CancellationError {
                 await self?.finishSegmentationLane(summary: nil, cancelled: true)
@@ -1647,6 +1751,7 @@ final class AppModel: ObservableObject {
 
     private func startEvidenceLane() {
         guard !isBackgroundControlBarrierActive,
+              !isSourceCircuitOpen,
               !isEvidencePaused,
               evidenceLaneFailure == nil,
               indexTask == nil,
@@ -1658,11 +1763,17 @@ final class AppModel: ObservableObject {
         let generation = evidenceEventGeneration
         indexTask = Task(priority: .utility) { [weak self] in
             do {
-                let summary = try await indexer.runUntilIdle { [weak self] event in
-                    Task { @MainActor [weak self] in
-                        self?.receive(event, generation: generation)
+                let summary = try await indexer.runUntilIdle(
+                    onEvent: { [weak self] event in
+                        Task { @MainActor [weak self] in
+                            self?.receive(event, generation: generation)
+                        }
+                    },
+                    onSourceUnavailable: { [weak self] error in
+                        guard let self else { return .park }
+                        return await self.handleSourceUnavailable(error)
                     }
-                }
+                )
                 await self?.finishEvidenceLane(summary: summary, cancelled: false)
             } catch is CancellationError {
                 await self?.finishEvidenceLane(summary: nil, cancelled: true)
@@ -1676,6 +1787,7 @@ final class AppModel: ObservableObject {
         // 先占位防重入；缓存进度在另一条车道提交新任务时可能过期，
         // 因此空闲时用实时查询决定是否需要启动。
         guard !isBackgroundControlBarrierActive,
+              !isSourceCircuitOpen,
               !isDescriptionPaused,
               descriptionLaneFailure == nil,
               describeTask == nil,
@@ -1696,11 +1808,17 @@ final class AppModel: ObservableObject {
                 }
             }
             do {
-                let summary = try await describeQueue.runUntilIdle { [weak self] event in
-                    Task { @MainActor [weak self] in
-                        self?.receiveDescribe(event, generation: generation)
+                let summary = try await describeQueue.runUntilIdle(
+                    onEvent: { [weak self] event in
+                        Task { @MainActor [weak self] in
+                            self?.receiveDescribe(event, generation: generation)
+                        }
+                    },
+                    onSourceUnavailable: { [weak self] error in
+                        guard let self else { return .park }
+                        return await self.handleSourceUnavailable(error)
                     }
-                }
+                )
                 await self.finishDescriptionLane(summary: summary, cancelled: false)
             } catch is CancellationError {
                 await self.finishDescriptionLane(summary: nil, cancelled: true)
@@ -1728,12 +1846,73 @@ final class AppModel: ObservableObject {
         await task.value
     }
 
+    // MARK: 源不可用断路（sourceUnavailable）
+
+    /// 车道的源不可用通知入口：开路停车并聚合成可操作告警；退火到期时
+    /// 返回 .failJob，车道把该任务按普通失败处理，队列按既有语义前进。
+    private func handleSourceUnavailable(_ error: SourceUnavailableError) async -> SourceUnavailableDisposition {
+        let disposition = await sourceCircuitBoard.beginOpen(
+            rootID: error.rootID,
+            reason: error.underlyingDescription
+        )
+        guard disposition == .park else { return disposition }
+        isSourceCircuitOpen = true
+        let root = roots.first(where: { $0.id == error.rootID })
+        recordBackgroundWarning(
+            id: "source.\(error.rootID)",
+            title: "媒体源暂时不可访问：\(root?.name ?? error.rootID)",
+            detail: "\(root?.path ?? "")\n处理已暂停，未产生失败任务；源恢复后可继续。\n\(error.errorDescription ?? "")\n恢复方式：右键该媒体库“重新授权”或“重新扫描”，或点击“重试读取源”。"
+        )
+        statusMessage = "媒体源不可用，处理已暂停"
+        return disposition
+    }
+
+    private func refreshSourceCircuitFlag() async {
+        isSourceCircuitOpen = await sourceCircuitBoard.hasOpenCircuit
+    }
+
+    /// 定向恢复（重新授权 / 权威重扫）的解除入口；代际不匹配时不动新断路。
+    @discardableResult
+    private func clearSourceCircuitIfMatching(rootID: String, generation: Int) async -> Bool {
+        guard await sourceCircuitBoard.clear(rootID: rootID, ifGeneration: generation) else {
+            return false
+        }
+        await refreshSourceCircuitFlag()
+        clearBackgroundWarning(id: "source.\(rootID)")
+        return true
+    }
+
+    /// 成功物化某源的视频即复位该根的断路退火计数；车道成功事件驱动，节流无关紧要。
+    private func recordSourceMaterialization(assetID: String) {
+        guard let rootID = assets.first(where: { $0.id == assetID })?.rootID else { return }
+        Task { [sourceCircuitBoard] in
+            await sourceCircuitBoard.recordMaterialization(rootID: rootID)
+        }
+    }
+
+    /// 显式恢复入口：清除全部源断路并立即重试（NAS 原地恢复、既无需重授权
+    /// 也未触发重扫时使用）。断路期间没有失败任务，“重试失败任务”按钮
+    /// 无法承担该职责。
+    func retrySourceCircuits() {
+        Task { [weak self] in
+            guard let self else { return }
+            await self.sourceCircuitBoard.clearAll()
+            await self.refreshSourceCircuitFlag()
+            for warning in self.backgroundWarnings where warning.id.hasPrefix("source.") {
+                self.clearBackgroundWarning(id: warning.id)
+            }
+            self.statusMessage = "已重试媒体源，处理继续"
+            self.startIndexing()
+        }
+    }
+
     private func receiveSegmentation(_ event: SegmentationEvent, generation: Int) async {
         guard generation == segmentationEventGeneration, segmentationTask != nil else { return }
         segmentationProgress = event.progress
         evidenceStatusMessage = "\(stageName(event.stage))：\(event.assetName)"
         scheduleDetailRefresh(matching: event.assetID)
         if event.stage == "complete" {
+            recordSourceMaterialization(assetID: event.assetID)
             // The producer publishes after the new generation is committed.
             // Reconcile immediately so this video can enter ASR/OCR; the
             // producer remains gated from the next video meanwhile.
@@ -1749,8 +1928,11 @@ final class AppModel: ObservableObject {
         scheduleDetailRefresh(matching: event.assetID)
         // SegmentIndexer guarantees that `complete` is emitted after the matching
         // description job is enqueued, so no per-event database task is needed.
-        if event.stage == "complete", describeTask == nil {
-            startDescriptionLane()
+        if event.stage == "complete" {
+            recordSourceMaterialization(assetID: event.assetID)
+            if describeTask == nil {
+                startDescriptionLane()
+            }
         }
         refreshProcessingStatusThrottled()
     }
@@ -1760,6 +1942,9 @@ final class AppModel: ObservableObject {
         describeProgress = event.progress
         descriptionStatusMessage = "\(stageName(event.stage))：\(event.assetName) · 片段 \(event.segmentOrdinal + 1)"
         scheduleDetailRefresh(matching: event.assetID)
+        if event.stage == "described" {
+            recordSourceMaterialization(assetID: event.assetID)
+        }
         refreshProcessingStatusThrottled()
     }
 
