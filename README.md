@@ -1,92 +1,117 @@
 # Media Memory
 
-一个本地优先的 macOS 个人影像搜索工具：把本地或 NAS 视频变成可核对、可搜索、可直接跳回原片的时间证据。
+**把你的视频变成一句话就能找回的时间证据。**
 
-![Media Memory 空媒体库界面](docs/images/overview.png)
+硬盘和 NAS 里躺着几百个视频，你记得"拍过"，却永远找不到"在哪一段"。Media Memory 在本地把视频读完、听懂、建好索引：说出你记得的原话、画面里的字，或者只描述那个场景——它把那几秒找出来，附上证据，点击直接跳回原片播放。
 
-## 能做什么
+![一句话搜索，从命中时间播放原片](docs/images/search.png)
 
-- 只读扫描目录或单个视频，识别新增、移动、变化、缺失与暂时离线；
-- 按画面变化与停顿生成内容片段，再提取 ASR、句子时间、OCR、代表帧与多模态向量；
-- 字面结果立即返回，模型可用时异步合并语义召回；
-- 每条结果展示命中的画面、语音或文字证据，并从源时间直接播放原文件；
-- 建库、描述、扫描、搜索与浏览相互隔离，支持暂停、恢复、失败重试和异常退出恢复；
-- 业务数据默认保存在本机，API key 只进入 macOS 钥匙串。
+> 本地优先的 macOS 原生应用 · Apple silicon · macOS 15+ · MIT
 
-```mermaid
-flowchart LR
-    A[本地 / NAS 视频<br/>只读] --> B[内容分片]
-    B --> C[ASR · 对齐 · OCR · Embedding]
-    C --> D[画面描述]
-    C --> E[字面 + 语义检索]
-    D --> E
-    E --> F[证据核对 + 原片播放]
-```
+[安装](#安装) · [配置模型](#配置模型) · [使用指南](docs/user-guide.md)
+
+---
+
+## 它是怎么工作的
+
+![从视频到一句话找回](docs/images/pipeline.svg)
+
+## 为什么不一样
+
+### 每个结果都有证据，不是黑盒打分
+
+搜索结果直接展示命中的**画面帧、口中原话、画面文字**——你能亲眼核对"它为什么命中"。点击结果，播放器从源时间轴的命中点开始播放原文件，不生成代理、不看低清预览。
+
+![片段证据与自动描述](docs/images/detail.png)
+
+### 字面与语义，两路都能查
+
+- 记得原话？"六十万"、"欢迎光临"——语音转写按句子时间精确定位；
+- 记得画面文字？菜单、路牌、字幕——OCR 全文可搜；
+- 只记得场景？"在餐厅吃饭点啤酒"——语义向量按画面找回来。
+
+三种线索一套搜索框，结果按视频聚合，长视频不会刷屏。
+
+### 内容感知切片，不硬切
+
+不按固定 20 秒切，而是跟随画面变化与自然停顿，切出 4–30 秒的内容片段——搜索命中落在完整的动作和句子上，而不是被拦腰截断的碎片。
+
+### 原素材只读，删除可逆
+
+扫描、识别、索引、播放全程不修改源文件。移除媒体库或单个视频只删除索引和派生数据，你的视频原封不动。书签按需解析，离线的 NAS 不会被启动扫描批量唤醒。
+
+### 本地优先，数据不出机器
+
+- 素材、索引、转写、描述全部保存在本机；
+- API key 只进 macOS 钥匙串，配置文件不含密钥；
+- 没有云端账号、遥测、崩溃上报和自动更新；
+- 模型服务可以全程运行在本机，个人素材不必经过任何网络。
+
+### 模型供应商中立
+
+不绑定任何供应商。四项能力（语音识别、句子时间定位、多模态向量、画面描述）分别配置请求地址、模型名称和鉴权方式，每项都有"测试"按钮用应用生成的样例验证连通。对齐和向量还可选用内置本地 Worker。
+
+![模型设置](docs/images/settings.png)
+
+### 建库扛得住意外
+
+建库和描述分别可暂停、恢复、失败重试；异常退出后已完成结果保留、残留任务自动回队；NAS 断连时整体停车保护，不制造上百条失败记录，恢复连接后重扫即可续上。
+
+## 30 秒上手
+
+1. **装好应用** —— 从 [Releases](https://github.com/NimbuSHh/media-memory/releases) 下载 DMG 拖进 Applications；
+2. **测通模型** —— 打开"模型设置"，四项测试通过后保存（默认配置指向本机服务）；
+3. **添加目录，开始搜索** —— 选择本地/NAS 目录或单个视频，后台建库完成后输入一句话。
+
+支持 `3gp` `avi` `m2ts` `m4v` `mkv` `mov` `mp4` `mts` `webm`（能否解码取决于系统 AVFoundation）。
 
 ## 安装
 
-要求 Apple silicon Mac、macOS 15 或更高版本。普通用户不需要安装 Xcode。
+要求 **Apple silicon Mac、macOS 15 或更高版本**，无需 Xcode。
 
-### DMG
+从 [GitHub Releases](https://github.com/NimbuSHh/media-memory/releases) 下载 `Media-Memory-版本-arm64.dmg`，把 App 拖入 Applications。Release 附带 SHA-256 校验文件。
 
-从 [GitHub Releases](https://github.com/NimbuSHh/media-memory/releases) 下载 `Media-Memory-版本-arm64.dmg`，把 App 拖入 Applications。
-
-这是没有 Apple 公证的个人开源应用。首次打开若被 macOS 拦截，请进入“系统设置 → 隐私与安全”，在 Media Memory 的安全提示下选择“仍要打开”。DMG 同时提供 SHA-256 校验文件。
-
-`v0.1.2` 起 Release 内的 App 使用固定的免费自签名身份。它能让连续版本保持同一代码身份，但不等同于 Apple Developer ID，首次下载仍需手动放行。从 `v0.1.1` 的 ad-hoc 签名升级时，旧配置会先要求你在模型设置中确认鉴权方式，不会在启动时读取不确定的旧 key；确认并保存前，模型建库和语义检索暂停，本地浏览与字面搜索仍可用。媒体书签只在扫描、处理或播放时解析。macOS 仍可能在这些显式操作中要求一次钥匙串或媒体目录授权。
-
-### Homebrew
-
-公开 Homebrew Tap 尚未配置；当前请使用 GitHub Release DMG。Release 会附带生成后的 Cask 文件供后续建立 Tap 时审计，但现在不要使用尚不存在的 `NimbuSHh/tap/media-memory` 安装命令。
+这是未经 Apple 公证的个人开源应用，首次打开若被拦截：**系统设置 → 隐私与安全性 → 仍要打开**。从旧版本升级的签名与授权迁移说明见[使用指南](docs/user-guide.md#1-安装应用)。
 
 ## 配置模型
 
-Media Memory 不绑定模型供应商，也不要求服务一定在本机。每项能力分别配置请求 URL、模型名称和鉴权方式；只有选择 Bearer 鉴权时才读取或保存该能力的 API key，本机默认服务完全不访问钥匙串。
+Media Memory 只认接口契约，不认品牌。每项能力独立配置，只有选择 Bearer 鉴权时才会读写该能力的 API key：
 
-| 能力 | HTTP 接口 |
+| 能力 | 接口 |
 | --- | --- |
 | 语音识别 | OpenAI 兼容 `audio/transcriptions` |
 | 句子时间定位 | Media Memory alignment 契约，或内置本地 Worker |
 | 多模态向量 | Media Memory multimodal embedding 契约，或内置本地 Worker |
 | 画面描述 | OpenAI 兼容多模态 `chat/completions` |
 
-![模型设置](docs/images/settings.png)
+"测试"按钮发送应用自生成的音频/图片样本，不读取媒体库。完整请求与响应格式见[模型服务接口](docs/model-service-api.md)。
 
-配置页的每个模型都有“测试”按钮，会使用应用生成的测试音频/图片发送一次真实请求，不读取媒体库。四项测试成功后保存，再添加资源库即可使用。完整请求与响应格式见[模型服务接口](docs/model-service-api.md)。
-
-为了避免个人音频、图片和文字证据经过网络，建议优先选择本机模型服务。若使用远程服务，请确认服务可信并使用 HTTPS；具体数据出口见[隐私与数据边界](docs/privacy.md)。
-
-## 添加资源库
-
-1. 点击“添加目录或视频”，选择本地/NAS 目录或视频文件；
-2. 应用只读扫描并在后台完成分片、建库和描述；
-3. 输入一句话搜索，点击结果即可从命中时间播放原片。
-
-操作、错误恢复和删除方法见[使用指南](docs/user-guide.md)。
+> 建议优先使用本机模型服务。若使用远程服务请确认可信并启用 HTTPS，具体数据出口见[隐私与数据边界](docs/privacy.md)。
 
 ## 从源码构建
 
-开发环境需要完整 Xcode 与 Swift 6.2：
+需要完整 Xcode 与 Swift 6.2：
 
 ```bash
 ./Scripts/build-app.sh
 open ".build/Media Memory.app"
+xcrun swift test
 ```
 
-正式包默认要求本机钥匙串中存在 `Media Memory Release Signing` 身份。仅做本地开发时，可显式设置 `MEDIA_MEMORY_SIGNING_IDENTITY=-` 生成不可发布的 ad-hoc 构建；私钥和 `.p12` 永远不进入仓库或产物。
+真实模型与性能测试默认关闭，开启方式与发布流程见[发布说明](docs/releasing.md)。
 
-```bash
-DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcrun swift test
-```
+## 文档
 
-真实模型和性能测试默认关闭，显式设置 `MEDIA_MEMORY_RUN_MODEL_TESTS=1` 或 `MEDIA_MEMORY_RUN_PERFORMANCE_TESTS=1` 后运行对应测试。发布流程见[发布说明](docs/releasing.md)。
+- [使用指南](docs/user-guide.md) —— 安装、升级迁移、恢复操作
+- [模型服务接口](docs/model-service-api.md) —— 四项能力的 HTTP 契约
+- [隐私与数据边界](docs/privacy.md) —— 数据位置与网络出口
+- [技术方案](docs/architecture.md) —— 产品与架构的单一方案来源
 
 ## 发布边界
 
-- DMG 内的 App 使用项目发布者本机持有的长期自签名身份，未加入 Apple Developer Program、未做 Developer ID 签名或 Apple 公证；
-- 仓库和 DMG 不分发模型服务、Python/MLX 运行时或模型权重；
-- 内置本地 Worker 是默认适配器，不是产品对 oMLX 的强制依赖；
-- 不包含统计、遥测、崩溃上报、云端账号或自动更新。
+- DMG 使用项目发布者的长期自签名身份，未加入 Apple Developer Program、未做 Developer ID 签名或公证；
+- 仓库与 DMG 不分发模型服务、Python/MLX 运行时或模型权重；
+- 不含统计、遥测、崩溃上报、云端账号或自动更新。
 
 ## 许可证
 

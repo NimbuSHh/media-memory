@@ -1,0 +1,62 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1040 240" font-family="-apple-system, 'PingFang SC', 'Helvetica Neue', sans-serif">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#9CA3AF"/>
+    </marker>
+    <linearGradient id="cardGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#F5F7FA"/>
+    </linearGradient>
+    <linearGradient id="heroGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#4F7CF7"/>
+      <stop offset="1" stop-color="#7C5CF0"/>
+    </linearGradient>
+  </defs>
+
+  <!-- step 1: source videos -->
+  <g>
+    <rect x="16" y="52" width="196" height="120" rx="14" fill="url(#cardGrad)" stroke="#E3E7EE"/>
+    <text x="114" y="86" text-anchor="middle" font-size="15" font-weight="600" fill="#1F2937">本地 / NAS 视频</text>
+    <text x="114" y="110" text-anchor="middle" font-size="12.5" fill="#6B7280">硬盘、NAS、相机素材</text>
+    <rect x="46" y="126" width="136" height="26" rx="13" fill="#ECFDF5"/>
+    <text x="114" y="143" text-anchor="middle" font-size="12" font-weight="600" fill="#047857">全程只读 · 不改源文件</text>
+  </g>
+
+  <line x1="216" y1="112" x2="256" y2="112" stroke="#9CA3AF" stroke-width="1.6" marker-end="url(#arrow)"/>
+
+  <!-- step 2: build index -->
+  <g>
+    <rect x="260" y="52" width="240" height="120" rx="14" fill="url(#cardGrad)" stroke="#E3E7EE"/>
+    <text x="380" y="86" text-anchor="middle" font-size="15" font-weight="600" fill="#1F2937">自动建库</text>
+    <text x="380" y="110" text-anchor="middle" font-size="12.5" fill="#6B7280">语音转写 · 句级时间 · 画面文字</text>
+    <text x="380" y="130" text-anchor="middle" font-size="12.5" fill="#6B7280">代表帧 · 语义向量</text>
+    <rect x="290" y="142" width="180" height="22" rx="11" fill="#EEF2FF"/>
+    <text x="380" y="157" text-anchor="middle" font-size="11.5" font-weight="600" fill="#4F46E5">可暂停 · 可恢复 · 崩溃不丢</text>
+  </g>
+
+  <line x1="504" y1="112" x2="544" y2="112" stroke="#9CA3AF" stroke-width="1.6" marker-end="url(#arrow)"/>
+
+  <!-- step 3: search -->
+  <g>
+    <rect x="548" y="52" width="216" height="120" rx="14" fill="url(#cardGrad)" stroke="#E3E7EE"/>
+    <text x="656" y="86" text-anchor="middle" font-size="15" font-weight="600" fill="#1F2937">一句话搜索</text>
+    <text x="656" y="110" text-anchor="middle" font-size="12.5" fill="#6B7280">记得的原话 · 画面里的字</text>
+    <text x="656" y="130" text-anchor="middle" font-size="12.5" fill="#6B7280">或只描述那个场景</text>
+    <rect x="578" y="142" width="156" height="22" rx="11" fill="#FEF3C7"/>
+    <text x="656" y="157" text-anchor="middle" font-size="11.5" font-weight="600" fill="#B45309">字面 + 语义 双路召回</text>
+  </g>
+
+  <line x1="768" y1="112" x2="808" y2="112" stroke="#9CA3AF" stroke-width="1.6" marker-end="url(#arrow)"/>
+
+  <!-- step 4: jump back -->
+  <g>
+    <rect x="812" y="52" width="212" height="120" rx="14" fill="url(#heroGrad)"/>
+    <text x="918" y="88" text-anchor="middle" font-size="15" font-weight="600" fill="#FFFFFF">跳回原片那一秒</text>
+    <text x="918" y="112" text-anchor="middle" font-size="12.5" fill="#E0E7FF">命中画面 · 原话 · 文字为证</text>
+    <text x="918" y="132" text-anchor="middle" font-size="12.5" fill="#E0E7FF">点击即从源时间播放</text>
+  </g>
+
+  <!-- privacy footer -->
+  <rect x="16" y="192" width="1008" height="34" rx="10" fill="#F0FDF4" stroke="#BBF7D0"/>
+  <text x="520" y="214" text-anchor="middle" font-size="12.5" fill="#166534">本地优先：素材、索引、模型服务都可以不出这台 Mac —— 没有云端账号，没有遥测</text>
+</svg>
