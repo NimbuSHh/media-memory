@@ -1,5 +1,5 @@
 cask "media-memory" do
-  version "0.1.3"
+  version "0.1.4"
   sha256 "REPLACE_WITH_RELEASE_SHA256"
 
   url "https://github.com/NimbuSHh/media-memory/releases/download/v#{version}/Media-Memory-#{version}-arm64.dmg"

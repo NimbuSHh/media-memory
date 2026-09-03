@@ -1,0 +1,9 @@
+Media Memory v0.1.4 reworks how scanning fits a growing library. Adding a new media root now scans only that root instead of re-probing every file already in the library — on a NAS, adding a second folder no longer means waiting for the first one to be reopened file by file. Scan requests that arrive while another scan is running now queue and execute in order instead of being silently dropped, so a directory added mid-scan can no longer be missed permanently. Startup maintenance now performs a lightweight refresh of all enabled roots (directory enumeration and metadata comparison only, no per-file media probing), giving removed or changed files a regular detection window; the context-menu "重新扫描" remains the authoritative full probe. One deliberate trade-off: a file whose size, modification date and identifier are all unchanged but whose content was swapped in place is only detected by a manual full rescan. The sidebar selection highlight is now drawn entirely by the app — row background and text colors switch in the same frame — eliminating the delayed system selection animation that made highlights lag or flicker. Adds 7 regression tests (133 total).
+
+Upgrade notes from v0.1.3:
+
+- No database migration is involved; the schema stays at v9 and all indexed data is retained.
+- On launch the app now walks the directory tree of every enabled media root once (metadata only, no per-file probing). If a volume is offline at startup, this surfaces as a single warning listing the affected roots instead of failed tasks; the library keeps working from local data, and the volume is picked up again by the next successful launch or rescan.
+- Manual rescans are unchanged: the per-root context-menu "重新扫描" still probes every file and remains the authority for missing-file detection.
+
+The App remains self-signed and is not Apple-notarized. The signing private key and encrypted backup are not included in the repository, DMG, or Release assets.
