@@ -145,6 +145,6 @@ GitHub Release 和 tag 不覆盖、不复用。若发布产物有问题：
 - 默认测试：133 项，3 项按显式开关跳过，0 失败（含 7 项新增扫描刷新回归）；
 - 连续 build 5/6 均由 `Media Memory Release Signing` 签名，公开证书 SHA-256 为 `c90b71af651fafe33f62510ca3d163065273f43266df9780e59d79f30ac40411`（与 0.1.2/0.1.3 基线一致），Authority 与完整 designated requirement 一致；
 - 最终 arm64 App 为 `0.1.4 (5)`，Bundle ID 为 `io.github.nimbushh.media-memory`，`codesign --verify --deep --strict` 通过；
-- 最终 DMG 可挂载并通过映像校验，包含 App、Applications 链接、许可证和安装说明；SHA-256 文件校验通过（`435bfacb3caeeb6cdb553ca683d4a9130216f82502bab9e887c0b92d20422b48`）；扫描未发现个人绝对路径、私钥/`.p12`、数据库、测试视频、模型权重或 Bearer 密钥模式；
+- 最终 DMG 可挂载并通过映像校验，包含 App、Applications 链接、许可证和安装说明；SHA-256 文件校验通过（`9397603380d72b69e6d9a2d7c145657c3c5b959848d90216b20a596d9ee60ba0`，以 `publish-release.sh` 最终重建并上传的 DMG 为准——GPT UUID 使每次 `hdiutil create` 产物字节不同，验收记录必须以发布后产物回填）；最终 DMG 重新挂载复核内容与敏感信息扫描，未见个人绝对路径、私钥/`.p12`、数据库、测试视频、模型权重或 Bearer 密钥模式；
 - 实机冒烟：0.1.3 实例优雅退出后启动 0.1.4 构建副本，主窗口正常渲染（本版无 schema 迁移，schema 保持 v9）；完整 GUI 人工走查未在本轮重做，行为回归由 133 项自动化测试（含 7 项新增）覆盖；
 - 本版变更：扫描 full/refresh 双模式与串行扫描队列（D-022，并修订 D-018 的启动语义）、启动轻量刷新检测文件消失、添加媒体只扫新增根、侧栏选中高亮自绘；升级说明见 `Packaging/release-notes-v0.1.4.md`。
