@@ -161,6 +161,122 @@ public actor MediaDatabase {
         }
     }
 
+    /// 轻量刷新的执行计划：元数据与库内记录完全一致、且仍是就绪状态的
+    /// 候选不需要探测；其余（新增、元数据漂移、非就绪）都要重新探测。
+    /// 元数据一致但内容不同的极端情形（同尺寸同 mtime 被换文件）由
+    /// 手动"重新扫描"的全量探测兜底，轻量刷新不为此打开每个文件。
+    public func planScanRefresh(
+        rootID: String,
+        candidates: [MediaScanCandidate]
+    ) throws -> ScanRefreshPlan {
+        let statement = try connection.prepare(
+            """
+            SELECT relative_path, file_identifier, file_size, modification_time,
+                   status, invalidated_at
+            FROM media_asset
+            WHERE root_id = ?
+            """
+        )
+        try statement.bind(.text(rootID), at: 1)
+        struct KnownState {
+            let fileIdentifier: String?
+            let fileSize: Int64
+            let modificationTime: Double
+            let isReady: Bool
+        }
+        var knownByPath: [String: KnownState] = [:]
+        while try statement.step() {
+            guard let relativePath = statement.text(at: 0) else { continue }
+            knownByPath[relativePath] = KnownState(
+                fileIdentifier: statement.text(at: 1),
+                fileSize: statement.integer(at: 2),
+                modificationTime: statement.real(at: 3),
+                isReady: statement.text(at: 4) == MediaAssetStatus.ready.rawValue
+                    && statement.real(at: 5) == 0
+            )
+        }
+
+        var unchanged: [String] = []
+        var toProbe: [MediaScanCandidate] = []
+        for candidate in candidates {
+            if let known = knownByPath[candidate.relativePath],
+               known.isReady,
+               known.fileSize == candidate.fileSize,
+               known.modificationTime == candidate.modificationDate.timeIntervalSince1970,
+               known.fileIdentifier == nil
+                   || candidate.fileIdentifier == nil
+                   || known.fileIdentifier == candidate.fileIdentifier {
+                unchanged.append(candidate.relativePath)
+            } else {
+                toProbe.append(candidate)
+            }
+        }
+        return ScanRefreshPlan(unchangedRelativePaths: unchanged, toProbe: toProbe)
+    }
+
+    /// 提交轻量刷新：先按权威性整根标记缺失，再恢复仍在盘上的未变化
+    /// 资产，最后提交探测产物。同一事务完成，外部读不到中间态。
+    /// `isAuthoritative` 要求枚举与探测都完整；不完整时只提交观察值，
+    /// 不作任何缺失判定（与 applyScan 的不确定扫描语义一致）。
+    public func applyScanRefresh(
+        rootID: String,
+        unchangedRelativePaths: [String],
+        probed: MediaScanResult,
+        isAuthoritative: Bool,
+        scannedAt: Date = Date()
+    ) throws {
+        try connection.inTransaction {
+            if isAuthoritative {
+                let missing = try connection.prepare(
+                    """
+                    UPDATE media_asset
+                    SET status = 'missing', invalidated_at = ?
+                    WHERE root_id = ? AND invalidated_at IS NULL
+                    """
+                )
+                try missing.bind(.real(scannedAt.timeIntervalSince1970), at: 1)
+                try missing.bind(.text(rootID), at: 2)
+                _ = try missing.step()
+            }
+
+            // 分批恢复：IN 列表参数量受 SQLite 上限约束。
+            var offset = 0
+            while offset < unchangedRelativePaths.count {
+                let batch = unchangedRelativePaths[
+                    offset..<min(offset + 500, unchangedRelativePaths.count)
+                ]
+                offset += 500
+                let placeholders = batch.map { _ in "?" }.joined(separator: ",")
+                let restore = try connection.prepare(
+                    """
+                    UPDATE media_asset
+                    SET status = 'ready', invalidated_at = NULL, last_seen_at = ?
+                    WHERE root_id = ? AND relative_path IN (\(placeholders))
+                    """
+                )
+                try restore.bind(.real(scannedAt.timeIntervalSince1970), at: 1)
+                try restore.bind(.text(rootID), at: 2)
+                for (index, relativePath) in batch.enumerated() {
+                    try restore.bind(.text(relativePath), at: Int32(index + 3))
+                }
+                _ = try restore.step()
+            }
+
+            for asset in probed.assets {
+                try upsert(asset: asset, rootID: rootID, seenAt: scannedAt)
+            }
+
+            if isAuthoritative {
+                let root = try connection.prepare(
+                    "UPDATE library_root SET last_scan_at = ? WHERE id = ?"
+                )
+                try root.bind(.real(scannedAt.timeIntervalSince1970), at: 1)
+                try root.bind(.text(rootID), at: 2)
+                _ = try root.step()
+            }
+        }
+    }
+
     public func mediaAssets(rootID: String? = nil) throws -> [MediaAssetRecord] {
         let sql: String
         if rootID == nil {

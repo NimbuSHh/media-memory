@@ -74,6 +74,18 @@ public struct ScannedMediaAsset: Equatable, Sendable {
     public let errorMessage: String?
 }
 
+/// 轻量刷新计划：`unchangedRelativePaths` 是元数据与库内记录一致的文件，
+/// 只刷新可见性；`toProbe` 是新增或已变化的文件，需要完整探测。
+public struct ScanRefreshPlan: Sendable {
+    public let unchangedRelativePaths: [String]
+    public let toProbe: [MediaScanCandidate]
+
+    public init(unchangedRelativePaths: [String], toProbe: [MediaScanCandidate]) {
+        self.unchangedRelativePaths = unchangedRelativePaths
+        self.toProbe = toProbe
+    }
+}
+
 public struct MediaScanResult: Equatable, Sendable {
     public let assets: [ScannedMediaAsset]
     public let unstableFileCount: Int

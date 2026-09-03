@@ -10,6 +10,7 @@ struct ContentView: View {
     }
 
     @ObservedObject var model: AppModel
+    @Environment(\.controlActiveState) private var controlActiveState
     @State private var pendingRootRemoval: LibraryRootRecord?
     @State private var pendingAssetRemoval: MediaAssetRecord?
     @State private var selectedSegmentID: String?
@@ -104,15 +105,16 @@ struct ContentView: View {
     }
 
     private var sidebar: some View {
-        List(selection: $model.selectedRootID) {
+        List {
             Section("媒体库") {
                 // 全部视频的统计只列数字；整体处理进度由左下角队列面板展示，
                 // 避免同一列里出现两条相同的总进度条。
                 VStack(alignment: .leading, spacing: 3) {
                     Label("全部视频", systemImage: "rectangle.stack")
-                    rootStatsCaption(model.libraryStatistics)
+                    rootStatsCaption(model.libraryStatistics, isSelected: false)
                 }
-                .tag(String?.none)
+                .contentShape(Rectangle())
+                .onTapGesture { model.selectedRootID = nil }
                 ForEach(model.roots) { root in
                     rootRow(root)
                 }
@@ -244,24 +246,63 @@ struct ContentView: View {
         .navigationSplitViewColumnWidth(min: 200, ideal: 230, max: 280)
     }
 
+    /// 选中行自绘高亮底色：前台窗口用强调色，后台窗口用系统的
+    /// 「未强调选中」色，与原生侧栏在两种窗口状态下的表现一致。
+    private var selectionHighlightColor: Color {
+        controlActiveState == .inactive
+            ? Color(nsColor: .unemphasizedSelectedContentBackgroundColor)
+            : .accentColor
+    }
+
+    /// 行标题色：前台选中时为强调底上的白字；其余情况用常规标题色。
+    private func titleColor(isSelected: Bool) -> Color {
+        guard isSelected, controlActiveState != .inactive else { return .primary }
+        return .white
+    }
+
+    /// 侧栏行次级文字色：前台选中时为强调底上的白字层级；后台选中行与
+    /// 未选中行用常规次级色（原生行为：后台选中 = 灰底 + 常规文字）。
+    private func sidebarTextColor(selected: Bool, onAccentOpacity: Double = 0.75) -> Color {
+        guard selected, controlActiveState != .inactive else { return .secondary }
+        return .white.opacity(onAccentOpacity)
+    }
+
     /// 侧栏路径行：名称、统计（视频数/大小/时长）、整体处理进度与上次扫描时间。
     private func rootRow(_ root: LibraryRootRecord) -> some View {
         let stats = model.rootStatistics[root.id]
+        let isSelected = model.selectedRootID == root.id
         return VStack(alignment: .leading, spacing: 3) {
             Label(
                 root.name,
                 systemImage: root.kind == .directory
                     ? "folder" : "doc.movie"
             )
-            rootStatsCaption(stats)
-            rootProcessingLine(stats?.queue)
+            .foregroundStyle(titleColor(isSelected: isSelected))
+            rootStatsCaption(stats, isSelected: isSelected)
+            rootProcessingLine(stats?.queue, isSelected: isSelected)
             if let lastScanAt = root.lastScanAt {
                 Text("扫描于 \(lastScanAt.formatted(date: .abbreviated, time: .shortened))")
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(sidebarTextColor(selected: isSelected, onAccentOpacity: 0.6))
             }
         }
-        .tag(Optional(root.id))
+        .contentShape(Rectangle())
+        .onTapGesture { model.selectedRootID = root.id }
+        // 选中高亮完全自绘（底色 + 文字在同一事务内同帧瞬切），不再使用
+        // List(selection:)：系统选中胶囊带延迟滑动动画且无法关闭，任何依赖
+        // 它的文字配色都会与之错位（"先消失/闪一下/红蓝并存"的根源）。
+        .animation(nil, value: isSelected)
+        .listRowBackground(
+            Group {
+                if isSelected {
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .fill(selectionHighlightColor)
+                        .padding(.horizontal, 5)
+                } else {
+                    Color.clear
+                }
+            }
+        )
         .contextMenu {
             Button("重新扫描\(root.kind == .directory ? "此目录" : "此文件")") {
                 model.rescanRoot(root)
@@ -278,16 +319,19 @@ struct ContentView: View {
 
     /// 统计行：视频数 · 总大小 · 总时长（时长未知时省略）。
     @ViewBuilder
-    private func rootStatsCaption(_ stats: RootLibraryStatistics?) -> some View {
+    private func rootStatsCaption(
+        _ stats: RootLibraryStatistics?,
+        isSelected: Bool
+    ) -> some View {
         if let stats, stats.videoCount > 0 {
             Text(rootStatsText(stats))
                 .font(.caption.monospacedDigit())
-                .foregroundStyle(.secondary)
+                .foregroundStyle(sidebarTextColor(selected: isSelected))
                 .lineLimit(1)
         } else {
             Text("尚无视频")
                 .font(.caption)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(sidebarTextColor(selected: isSelected))
         }
     }
 
@@ -304,28 +348,43 @@ struct ContentView: View {
 
     /// 该路径的整体处理进度：全部完成时显示对勾，
     /// 否则显示细进度条与完成计数（处理中/失败仅在非零时附加）。
+    /// 前台选中时语义色（绿/蓝/橙）在强调底上不可辨，收敛为白字层级，
+    /// 失败的警示信号由黄色三角图标保留；其余状态维持语义色。
     @ViewBuilder
-    private func rootProcessingLine(_ queue: VideoQueueSummary?) -> some View {
+    private func rootProcessingLine(
+        _ queue: VideoQueueSummary?,
+        isSelected: Bool
+    ) -> some View {
+        let emphasized = isSelected && controlActiveState != .inactive
         if let queue, queue.total > 0 {
             Group {
                 if queue.completed == queue.total, queue.failed == 0 {
                     Label("全部完成", systemImage: "checkmark.circle.fill")
-                        .foregroundStyle(.green)
+                        .foregroundStyle(emphasized ? Color.white.opacity(0.9) : Color.green)
                 } else {
                     HStack(spacing: 6) {
                         ProgressView(value: queue.completedFraction)
                             .frame(width: 44)
+                            .tint(emphasized ? Color.white.opacity(0.9) : nil)
                         Text("\(queue.completed)/\(queue.total)")
                         if queue.inProgress > 0 {
                             Text("处理中 \(queue.inProgress)")
-                                .foregroundStyle(.blue)
+                                .foregroundStyle(
+                                    emphasized ? Color.white.opacity(0.9) : Color.blue
+                                )
                         }
                         if queue.failed > 0 {
-                            Text("失败 \(queue.failed)")
-                                .foregroundStyle(.orange)
+                            HStack(spacing: 3) {
+                                Image(systemName: "exclamationmark.triangle.fill")
+                                    .foregroundStyle(.yellow)
+                                Text("失败 \(queue.failed)")
+                                    .foregroundStyle(
+                                        emphasized ? Color.white.opacity(0.9) : Color.orange
+                                    )
+                            }
                         }
                     }
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(sidebarTextColor(selected: isSelected))
                 }
             }
             .font(.caption2.monospacedDigit())

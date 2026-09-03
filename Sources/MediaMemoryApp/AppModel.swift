@@ -188,6 +188,9 @@ final class AppModel: ObservableObject {
     private var modelTestTasks: [ModelRole: Task<Void, Never>] = [:]
     private var testAllModelsTask: Task<Void, Never>?
     private var scanTask: Task<Void, Never>?
+    /// 扫描请求串行执行；扫描进行中到达的请求（如添加新媒体）在此排队，
+    /// 不再被静默丢弃。
+    private var scanQueue: [ScanRequest] = []
     private var segmentationTask: Task<Void, Never>?
     private var indexTask: Task<Void, Never>?
     private var describeTask: Task<Void, Never>?
@@ -301,6 +304,7 @@ final class AppModel: ObservableObject {
         guard !urls.isEmpty else { return }
         runLibraryOperation(status: "正在添加媒体…") { model in
             guard let database = model.database else { return }
+            var addedRoots: [LibraryRootRecord] = []
             for url in urls {
                 try Task.checkCancellation()
                 let standardized = url.standardizedFileURL
@@ -316,29 +320,48 @@ final class AppModel: ObservableObject {
                     bookmark: bookmark,
                     kind: isDirectory ? .directory : .file
                 )
+                addedRoots.append(root)
                 model.scopedLibraries[root.id] = access
             }
             try await model.refreshLibrary()
-            model.startScan()
+            // 只扫描本次添加的根；已有目录的缺失检测由启动与后续的轻量
+            // 刷新负责，添加操作不再放大成全库重扫。
+            model.enqueueScan(roots: addedRoots, mode: .refresh)
         }
     }
 
-    func startScan() {
-        guard database != nil else {
-            statusMessage = startupPhase == .loadingLocalData ? "正在读取本地数据…" : "数据库尚未就绪"
+    /// 扫描范围：`full` 逐文件探测（手动重扫）；`refresh` 只探测新增或
+    /// 元数据变化的文件（自动刷新），已有文件的缺失判定只依赖目录枚举。
+    enum ScanMode {
+        case full
+        case refresh
+    }
+
+    struct ScanRequest {
+        let roots: [LibraryRootRecord]
+        let mode: ScanMode
+    }
+
+    /// 扫描请求入口：空闲即启动，否则排队，完成后由 scan 的收尾依次取队首。
+    private func enqueueScan(roots: [LibraryRootRecord], mode: ScanMode) {
+        guard scanTask == nil else {
+            scanQueue.append(ScanRequest(roots: roots, mode: mode))
             return
         }
-        guard scanTask == nil else { return }
-        let targets = roots.filter(\.isEnabled)
-        guard !targets.isEmpty else {
-            statusMessage = "请先选择媒体目录"
-            return
-        }
+        startScanTask(ScanRequest(roots: roots, mode: mode))
+    }
+
+    private func startScanTask(_ request: ScanRequest) {
         isScanning = true
         scanStatusMessage = "正在准备扫描…"
         scanTask = Task(priority: .utility) { [weak self] in
-            await self?.scan(roots: targets)
+            await self?.scan(request)
         }
+    }
+
+    private func startNextQueuedScan() {
+        guard scanTask == nil, !scanQueue.isEmpty else { return }
+        startScanTask(scanQueue.removeFirst())
     }
 
     // MARK: 从库中删除
@@ -490,17 +513,17 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// 右键单个媒体库条目重新扫描（目录枚举或单文件探测）。
+    /// 右键单个媒体库条目重新扫描（完整探测；扫描进行中则排队）。
     func rescanRoot(_ root: LibraryRootRecord) {
-        guard database != nil, scanTask == nil, libraryTask == nil else {
+        guard database != nil else {
+            statusMessage = startupPhase == .loadingLocalData ? "正在读取本地数据…" : "数据库尚未就绪"
+            return
+        }
+        guard libraryTask == nil, settingsSaveTask == nil else {
             statusMessage = "已有媒体库操作正在进行，请稍候"
             return
         }
-        isScanning = true
-        scanStatusMessage = "正在准备扫描：\(root.name)"
-        scanTask = Task(priority: .utility) { [weak self] in
-            await self?.scan(roots: [root])
-        }
+        enqueueScan(roots: [root], mode: .full)
     }
 
     func reauthorizeRoot(_ root: LibraryRootRecord, using url: URL) {
@@ -1164,10 +1187,21 @@ final class AppModel: ObservableObject {
         )
     }
 
-    /// 后台维护只处理本机派生数据与模型运行时。媒体书签严格延迟到
-    /// 扫描、源缓存或播放真正需要该根时再解析，避免启动唤醒 NAS。
+    /// 启动轻量刷新：给"文件已从磁盘消失/变化"一个常规检测时机（此前
+    /// 只有添加媒体会触发扫描，缺失无从发现）。只做目录枚举 + 元数据
+    /// 比对，仅新增或变化的文件会被探测；与其他扫描请求共用串行队列。
+    private func enqueueStartupRefresh() {
+        let targets = roots.filter(\.isEnabled)
+        guard !targets.isEmpty else { return }
+        enqueueScan(roots: targets, mode: .refresh)
+    }
+
+    /// 后台维护只处理本机派生数据与模型运行时。媒体书签解析保持在需要时
+    /// 才发生（轻量刷新、源缓存或播放）；启动刷新只做目录枚举与 stat，
+    /// 不逐文件打开媒体，对 NAS 的扰动远小于旧的全量扫描。
     private func bootstrapMaintenance(generation: Int) async {
         guard let database, let searchDatabase, let sourceCache, let workRoot else { return }
+        enqueueStartupRefresh()
         do {
             try await recoverInterruptedJobsIfNeeded()
             try Task.checkCancellation()
@@ -1635,20 +1669,28 @@ final class AppModel: ObservableObject {
         if autoStart { startIndexing() }
     }
 
-    private func scan(roots rootsToScan: [LibraryRootRecord]) async {
+    private func scan(_ request: ScanRequest) async {
         errorMessage = nil
         clearBackgroundWarning(id: "scan")
+        // 主动停止时清空排队请求：停止扫描是最新意图，不能立刻又开下一轮。
+        var wasCancelled = false
         defer {
             isScanning = false
             scanTask = nil
+            if wasCancelled {
+                scanQueue.removeAll()
+            }
+            startNextQueuedScan()
         }
 
         do {
             guard let database else { throw AppLifecycleError.databaseUnavailable }
             var scanErrors: [String] = []
+            let rootsToScan = request.roots
             for (index, root) in rootsToScan.enumerated() {
                 try Task.checkCancellation()
-                scanStatusMessage = "正在扫描 \(index + 1)/\(rootsToScan.count)：\(root.name)"
+                let progressVerb = request.mode == .full ? "正在扫描" : "正在检查"
+                scanStatusMessage = "\(progressVerb) \(index + 1)/\(rootsToScan.count)：\(root.name)"
                 do {
                     // 恢复动作开始时捕获断路代际：扫描期间若新一轮源失败
                     // 重新开路，本次扫描不得误清它。
@@ -1661,16 +1703,48 @@ final class AppModel: ObservableObject {
                         access = try await authorizeLibrary(root)
                     }
                     let result: MediaScanResult
+                    let isAuthoritative: Bool
                     switch root.kind {
-                    case .directory:
-                        result = try await scanner.scan(rootURL: access.url)
                     case .file:
+                        // 单文件根只有一个文件，始终完整探测。
                         result = try await scanner.scanFile(fileURL: access.url)
+                        try await database.applyScan(rootID: root.id, result: result)
+                        isAuthoritative = result.isAuthoritativeComplete
+                    case .directory:
+                        switch request.mode {
+                        case .full:
+                            // 手动全量重扫：逐文件探测。
+                            result = try await scanner.scan(rootURL: access.url)
+                            try await database.applyScan(rootID: root.id, result: result)
+                            isAuthoritative = result.isAuthoritativeComplete
+                        case .refresh:
+                            // 轻量刷新：枚举 + 元数据分类，只探测新增或变化的文件。
+                            let enumeration = try scanner.enumerateRoot(rootURL: access.url)
+                            let plan = try await database.planScanRefresh(
+                                rootID: root.id,
+                                candidates: enumeration.candidates
+                            )
+                            let probed = try await scanner.probeFiles(
+                                rootURL: access.url,
+                                candidates: plan.toProbe
+                            )
+                            // 权威性要求枚举完整且探测无不确定项；只有权威刷新
+                            // 才能判定"未出现 = 已缺失"。
+                            let authoritative = enumeration.isComplete
+                                && probed.isAuthoritativeComplete
+                            try await database.applyScanRefresh(
+                                rootID: root.id,
+                                unchangedRelativePaths: plan.unchangedRelativePaths,
+                                probed: probed,
+                                isAuthoritative: authoritative
+                            )
+                            result = probed
+                            isAuthoritative = authoritative
+                        }
                     }
                     try Task.checkCancellation()
-                    try await database.applyScan(rootID: root.id, result: result)
                     // 权威重扫成功 = 恢复入口：定向解除该源的断路（代际匹配）。
-                    if let circuitGeneration, result.isAuthoritativeComplete {
+                    if let circuitGeneration, isAuthoritative {
                         await clearSourceCircuitIfMatching(
                             rootID: root.id,
                             generation: circuitGeneration
@@ -1696,11 +1770,14 @@ final class AppModel: ObservableObject {
                     detail: scanErrors.joined(separator: "\n")
                 )
             }
-            scanStatusMessage = "扫描完成：\(assets.count) 个视频"
+            scanStatusMessage = request.mode == .full
+                ? "扫描完成：\(assets.count) 个视频"
+                : "媒体库检查完成：\(assets.count) 个视频"
             if segmenter != nil {
                 try await prepareIndexQueue(autoStart: true)
             }
         } catch is CancellationError {
+            wasCancelled = true
             scanStatusMessage = "扫描已停止；已提交的数据保持完整"
         } catch {
             scanStatusMessage = "扫描失败：\(error.localizedDescription)"

@@ -43,3 +43,6 @@ work/
 .npmrc
 id_rsa
 id_ed25519
+
+# Local ZCode session state
+.zcode/

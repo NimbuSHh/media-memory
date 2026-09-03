@@ -23,6 +23,40 @@ public enum MediaScanError: Error, LocalizedError, Sendable {
     }
 }
 
+/// 轻量刷新用的候选文件：只有一次 stat 得到的元数据快照，
+/// 不包含任何探测产物。是否需要探测由数据库按既有记录分类决定。
+public struct MediaScanCandidate: Equatable, Sendable {
+    public let relativePath: String
+    public let standardizedPath: String
+    public let fileIdentifier: String?
+    public let fileSize: Int64
+    public let modificationDate: Date
+
+    public init(
+        relativePath: String,
+        standardizedPath: String,
+        fileIdentifier: String?,
+        fileSize: Int64,
+        modificationDate: Date
+    ) {
+        self.relativePath = relativePath
+        self.standardizedPath = standardizedPath
+        self.fileIdentifier = fileIdentifier
+        self.fileSize = fileSize
+        self.modificationDate = modificationDate
+    }
+}
+
+/// 刷新管线第一步的产物：完整枚举到的候选列表。`errors` 非空表示部分
+/// 子目录不可读，此时枚举不完整，不得据此判定"未出现 = 已缺失"。
+public struct MediaScanEnumeration: Sendable {
+    public let candidates: [MediaScanCandidate]
+    public let skippedFileCount: Int
+    public let errors: [String]
+
+    public var isComplete: Bool { errors.isEmpty }
+}
+
 public struct MediaScanner: Sendable {
     public static let supportedExtensions: Set<String> = [
         "3gp", "avi", "m2ts", "m4v", "mkv", "mov", "mp4", "mts", "webm"
@@ -100,6 +134,74 @@ public struct MediaScanner: Sendable {
         }
     }
 
+    /// 刷新管线第一步：枚举目录并记录每个候选文件的元数据快照。
+    /// 只读目录与 stat，不读文件内容、不探测媒体。
+    public func enumerateRoot(rootURL: URL) throws -> MediaScanEnumeration {
+        try Task.checkCancellation()
+        let root = rootURL.standardizedFileURL
+        let rootValues = try root.resourceValues(forKeys: [.isDirectoryKey])
+        guard rootValues.isDirectory == true else {
+            throw MediaScanError.invalidRoot(root.path)
+        }
+        let firstPass = try enumerateCandidates(root: root)
+        return MediaScanEnumeration(
+            candidates: firstPass.candidates.map(\.info),
+            skippedFileCount: firstPass.skippedCount,
+            errors: firstPass.errors
+        )
+    }
+
+    /// 刷新管线第二步：只对"新增或元数据已变"的候选做稳定窗复查与探测。
+    /// 未变化文件不进入该列表，因此不会被逐个打开。
+    public func probeFiles(
+        rootURL: URL,
+        candidates: [MediaScanCandidate]
+    ) async throws -> MediaScanResult {
+        try Task.checkCancellation()
+        let root = rootURL.standardizedFileURL
+        guard !candidates.isEmpty else {
+            return MediaScanResult(assets: [], unstableFileCount: 0, skippedFileCount: 0, errors: [])
+        }
+        try await Task.sleep(for: .milliseconds(750))
+        try Task.checkCancellation()
+
+        var assets: [ScannedMediaAsset] = []
+        var unstableCount = 0
+        var errors: [String] = []
+        for candidate in candidates {
+            try Task.checkCancellation()
+            let url = URL(fileURLWithPath: candidate.standardizedPath)
+            do {
+                let enumerationSnapshot = MediaFileSnapshot(
+                    fileSize: candidate.fileSize,
+                    modificationDate: candidate.modificationDate,
+                    fileIdentifier: candidate.fileIdentifier
+                )
+                let secondSnapshot = try FileFingerprint.snapshot(for: url)
+                guard secondSnapshot == enumerationSnapshot else {
+                    unstableCount += 1
+                    continue
+                }
+                let inspection = await inspect(url, root: root, snapshot: secondSnapshot)
+                if let asset = inspection.asset {
+                    assets.append(asset)
+                }
+                if let error = inspection.error {
+                    errors.append(error)
+                }
+            } catch {
+                errors.append("\(url.path)：\(error.localizedDescription)")
+            }
+        }
+
+        return MediaScanResult(
+            assets: assets.sorted { $0.relativePath.localizedStandardCompare($1.relativePath) == .orderedAscending },
+            unstableFileCount: unstableCount,
+            skippedFileCount: 0,
+            errors: errors
+        )
+    }
+
     public func scan(rootURL: URL) async throws -> MediaScanResult {
         try Task.checkCancellation()
         let root = rootURL.standardizedFileURL
@@ -149,7 +251,15 @@ public struct MediaScanner: Sendable {
 
     private struct Candidate {
         let url: URL
-        let snapshot: MediaFileSnapshot
+        let info: MediaScanCandidate
+
+        var snapshot: MediaFileSnapshot {
+            MediaFileSnapshot(
+                fileSize: info.fileSize,
+                modificationDate: info.modificationDate,
+                fileIdentifier: info.fileIdentifier
+            )
+        }
     }
 
     private func enumerateCandidates(
@@ -196,8 +306,18 @@ public struct MediaScanner: Sendable {
                     skippedCount += 1
                     continue
                 }
+                let snapshot = try FileFingerprint.snapshot(for: url)
                 candidates.append(
-                    Candidate(url: url.standardizedFileURL, snapshot: try FileFingerprint.snapshot(for: url))
+                    Candidate(
+                        url: url.standardizedFileURL,
+                        info: MediaScanCandidate(
+                            relativePath: makeRelativePath(url: url, root: root),
+                            standardizedPath: url.standardizedFileURL.path,
+                            fileIdentifier: snapshot.fileIdentifier,
+                            fileSize: snapshot.fileSize,
+                            modificationDate: snapshot.modificationDate
+                        )
+                    )
                 )
             } catch {
                 enumerationErrors.append("\(url.path)：\(error.localizedDescription)")
