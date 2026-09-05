@@ -148,3 +148,12 @@ GitHub Release 和 tag 不覆盖、不复用。若发布产物有问题：
 - 最终 DMG 可挂载并通过映像校验，包含 App、Applications 链接、许可证和安装说明；SHA-256 文件校验通过（`9397603380d72b69e6d9a2d7c145657c3c5b959848d90216b20a596d9ee60ba0`，以 `publish-release.sh` 最终重建并上传的 DMG 为准——GPT UUID 使每次 `hdiutil create` 产物字节不同，验收记录必须以发布后产物回填）；最终 DMG 重新挂载复核内容与敏感信息扫描，未见个人绝对路径、私钥/`.p12`、数据库、测试视频、模型权重或 Bearer 密钥模式；
 - 实机冒烟：0.1.3 实例优雅退出后启动 0.1.4 构建副本，主窗口正常渲染（本版无 schema 迁移，schema 保持 v9）；完整 GUI 人工走查未在本轮重做，行为回归由 133 项自动化测试（含 7 项新增）覆盖；
 - 本版变更：扫描 full/refresh 双模式与串行扫描队列（D-022，并修订 D-018 的启动语义）、启动轻量刷新检测文件消失、添加媒体只扫新增根、侧栏选中高亮自绘；升级说明见 `Packaging/release-notes-v0.1.4.md`。
+
+## 0.1.5 验收记录（2026-09-06）
+
+- 默认测试：207 项，3 项按显式开关跳过（真实模型×2、性能×1），0 失败；新增图片管线、相对路径筛选、凭据存储与 MCP 服务回归；
+- 连续构建签名一致性由 `verify-signing-stability.sh` 门禁通过（build 6/7），公开证书 SHA-256 为 `c90b71af651fafe33f62510ca3d163065273f43266df9780e59d79f30ac40411`（与 0.1.2–0.1.4 基线一致），Authority 与完整 designated requirement 一致；
+- 最终 arm64 App 为 `0.1.5 (6)`，Bundle ID 为 `io.github.nimbushh.media-memory`，`codesign --verify --deep --strict` 通过；
+- 最终 DMG 可挂载并通过映像校验，包含 App、Applications 链接、许可证和安装说明，`Contents/MacOS/` 内含 `MediaMemory` 与 `media-memory-mcp` 两个可执行文件；SHA-256 文件校验通过（`c1f878a2939bca9dc7889db84d059b46d50c0afe7c1407b352599e09795cfda4`，以发布后上传的最终产物回填——GPT UUID 使每次 `hdiutil create` 产物字节不同）；重新挂载敏感扫描未见私钥/`.p12`、数据库、个人绝对路径、测试视频、模型权重或 Bearer 密钥模式；
+- 实机冒烟：发布前同提交 ad-hoc 构建副本在发布者真实库（1,679 个媒体）首启完成 schema v9→v10→v11 原地迁移，主窗口、详情空态、模型设置与 Agent 接入面板实机走查正常（含品牌图标露出）；凭据自动迁移到 `model-credentials.json` 后模型服务配置原样可用；
+- 本版变更：图片一等公民（schema v10）、库级处理队列与 processing_rank（schema v11）、状态面板 v2、MCP 语义检索服务与 Agent 接入面板、凭据存储迁移（D-023）、相对路径筛选、羊毛毡拍立得品牌图标；升级说明见 `Packaging/release-notes-v0.1.5.md`。
