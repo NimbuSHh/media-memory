@@ -6,13 +6,17 @@ public enum MediaDatabaseOpenError: Error, LocalizedError, Equatable, Sendable {
     public var errorDescription: String? {
         switch self {
         case let .unsupportedSchemaVersion(version):
-            "数据库版本 \(version) 高于当前应用支持的版本 9，请使用更新版本的 Media Memory。"
+            "数据库版本 \(version) 高于当前应用支持的版本 \(MediaDatabase.supportedSchemaVersion)，请使用更新版本的 Media Memory。"
         }
     }
 }
 
 public actor MediaDatabase {
     let connection: SQLiteConnection
+
+    /// 当前程序支持的库 schema。只读消费者（MCP CLI）用它识别"库落后于
+    /// 程序、需要先打开应用完成迁移"的状态。
+    public static let supportedSchemaVersion: Int64 = 11
 
     public init(url: URL) throws {
         try FileManager.default.createDirectory(
@@ -40,12 +44,21 @@ public actor MediaDatabase {
         let existing = try root(path: normalizedPath)
         let id = existing?.id ?? UUID().uuidString
         let createdAt = existing?.createdAt ?? now
+        // 新库追加到处理队列队尾；已存在的库重连时保持原 rank。
+        var nextRank: Int64 = 0
+        if existing == nil {
+            let maxRank = try connection.prepare(
+                "SELECT COALESCE(MAX(processing_rank), -1) FROM library_root"
+            )
+            nextRank = (try maxRank.step() ? maxRank.integer(at: 0) : -1) + 1
+        }
 
         let statement = try connection.prepare(
             """
             INSERT INTO library_root (
-                id, path, kind, bookmark, is_enabled, created_at, last_scan_at
-            ) VALUES (?, ?, ?, ?, 1, ?, ?)
+                id, path, kind, bookmark, is_enabled, created_at, last_scan_at,
+                processing_rank
+            ) VALUES (?, ?, ?, ?, 1, ?, ?, ?)
             ON CONFLICT(path) DO UPDATE SET
                 bookmark = excluded.bookmark,
                 kind = excluded.kind,
@@ -62,6 +75,7 @@ public actor MediaDatabase {
         } else {
             try statement.bind(.null, at: 6)
         }
+        try statement.bind(.integer(existing.map { Int64($0.processingRank) } ?? nextRank), at: 7)
         _ = try statement.step()
 
         return LibraryRootRecord(
@@ -71,14 +85,16 @@ public actor MediaDatabase {
             bookmark: bookmark,
             isEnabled: true,
             createdAt: createdAt,
-            lastScanAt: existing?.lastScanAt
+            lastScanAt: existing?.lastScanAt,
+            processingRank: existing?.processingRank ?? Int(nextRank)
         )
     }
 
     public func libraryRoots() throws -> [LibraryRootRecord] {
         let statement = try connection.prepare(
             """
-            SELECT id, path, kind, bookmark, is_enabled, created_at, last_scan_at
+            SELECT id, path, kind, bookmark, is_enabled, created_at, last_scan_at,
+                   processing_rank
             FROM library_root
             ORDER BY created_at, path
             """
@@ -99,15 +115,34 @@ public actor MediaDatabase {
                     bookmark: bookmark,
                     isEnabled: statement.integer(at: 4) != 0,
                     createdAt: Date(timeIntervalSince1970: statement.real(at: 5)),
-                    lastScanAt: lastScan > 0 ? Date(timeIntervalSince1970: lastScan) : nil
+                    lastScanAt: lastScan > 0 ? Date(timeIntervalSince1970: lastScan) : nil,
+                    processingRank: Int(statement.integer(at: 7))
                 )
             )
         }
         return roots
     }
 
+    /// 把一个库移到处理队列最前。只改它自己的 rank（当前最小值减一），其余
+    /// 库的相对顺序保持不变；已完成库的 rank 保留，重新产生任务时回到原位置。
+    public func moveLibraryRootToFront(id: String) throws {
+        let statement = try connection.prepare(
+            """
+            UPDATE library_root
+            SET processing_rank = (SELECT MIN(processing_rank) FROM library_root) - 1
+            WHERE id = ?
+            """
+        )
+        try statement.bind(.text(id), at: 1)
+        _ = try statement.step()
+    }
+
     private static func rootKind(_ raw: String?) -> LibraryRootKind {
         raw.flatMap(LibraryRootKind.init(rawValue:)) ?? .directory
+    }
+
+    private static func mediaKind(_ raw: String?) -> MediaKind {
+        raw.flatMap(MediaKind.init(rawValue:)) ?? .video
     }
 
     public func setLibraryRootEnabled(id: String, enabled: Bool) throws {
@@ -284,7 +319,8 @@ public actor MediaDatabase {
                 SELECT id, root_id, relative_path, standardized_path, file_size,
                        modification_time, duration_ms, video_track_count,
                        audio_track_count, is_playable, fingerprint, status,
-                       error_message, first_seen_at, last_seen_at
+                       error_message, first_seen_at, last_seen_at,
+                       media_kind, pixel_width, pixel_height
                 FROM media_asset
                 WHERE invalidated_at IS NULL AND is_excluded = 0
                 ORDER BY relative_path COLLATE NOCASE
@@ -294,7 +330,8 @@ public actor MediaDatabase {
                 SELECT id, root_id, relative_path, standardized_path, file_size,
                        modification_time, duration_ms, video_track_count,
                        audio_track_count, is_playable, fingerprint, status,
-                       error_message, first_seen_at, last_seen_at
+                       error_message, first_seen_at, last_seen_at,
+                       media_kind, pixel_width, pixel_height
                 FROM media_asset
                 WHERE root_id = ? AND invalidated_at IS NULL AND is_excluded = 0
                 ORDER BY relative_path COLLATE NOCASE
@@ -332,7 +369,10 @@ public actor MediaDatabase {
                     status: status,
                     errorMessage: statement.text(at: 12),
                     firstSeenAt: Date(timeIntervalSince1970: statement.real(at: 13)),
-                    lastSeenAt: Date(timeIntervalSince1970: statement.real(at: 14))
+                    lastSeenAt: Date(timeIntervalSince1970: statement.real(at: 14)),
+                    mediaKind: Self.mediaKind(statement.text(at: 15)),
+                    pixelWidth: Int(statement.integer(at: 16)),
+                    pixelHeight: Int(statement.integer(at: 17))
                 )
             )
         }
@@ -344,9 +384,16 @@ public actor MediaDatabase {
             MediaLibrarySnapshot(
                 roots: try libraryRoots(),
                 assets: try mediaAssets(),
-                processingSummaries: try assetProcessingSummaries()
+                processingSummaries: try assetProcessingSummaries(),
+                queueStates: try libraryRootQueueStates()
             )
         }
+    }
+
+    public func schemaVersion() throws -> Int64 {
+        let statement = try connection.prepare("PRAGMA user_version")
+        guard try statement.step() else { return 0 }
+        return statement.integer(at: 0)
     }
 
     public func segments(assetID: String) throws -> [SegmentRecord] {
@@ -586,8 +633,9 @@ public actor MediaDatabase {
                 id, root_id, relative_path, standardized_path, file_identifier,
                 file_size, modification_time, duration_ms, video_track_count,
                 audio_track_count, is_playable, fingerprint, status, error_message,
-                first_seen_at, last_seen_at, invalidated_at, candidate_duration_ms
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+                first_seen_at, last_seen_at, invalidated_at, candidate_duration_ms,
+                media_kind, pixel_width, pixel_height
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 root_id = excluded.root_id,
                 relative_path = excluded.relative_path,
@@ -604,7 +652,10 @@ public actor MediaDatabase {
                 error_message = excluded.error_message,
                 last_seen_at = excluded.last_seen_at,
                 invalidated_at = NULL,
-                candidate_duration_ms = excluded.candidate_duration_ms
+                candidate_duration_ms = excluded.candidate_duration_ms,
+                media_kind = excluded.media_kind,
+                pixel_width = excluded.pixel_width,
+                pixel_height = excluded.pixel_height
             """
         )
         let values: [SQLiteValue] = [
@@ -624,14 +675,20 @@ public actor MediaDatabase {
             asset.errorMessage.map(SQLiteValue.text) ?? .null,
             .real(firstSeenAt.timeIntervalSince1970),
             .real(seenAt.timeIntervalSince1970),
-            candidateDurationMS.map(SQLiteValue.integer) ?? .null
+            candidateDurationMS.map(SQLiteValue.integer) ?? .null,
+            .text(asset.mediaKind.rawValue),
+            .integer(Int64(asset.pixelWidth)),
+            .integer(Int64(asset.pixelHeight))
         ]
         for (offset, value) in values.enumerated() {
             try statement.bind(value, at: Int32(offset + 1))
         }
         _ = try statement.step()
 
+        // V1 兼容段只服务"语义分析完成前视频可搜"的窗口；图片没有扫描期
+        // 兼容段，直接等待单段语义代际。
         if needsNewSegments, asset.status == .ready, asset.durationMS > 0,
+           asset.mediaKind == .video,
            !(try isExcluded(assetID: assetID)) {
             try createLegacyFallbackSegments(assetID: assetID, durationMS: authoritativeDurationMS)
         }
@@ -892,7 +949,7 @@ public actor MediaDatabase {
 
     private static func migrate(_ connection: SQLiteConnection) throws {
         let version = try schemaVersion(connection)
-        guard version <= 9 else {
+        guard version <= Self.supportedSchemaVersion else {
             throw MediaDatabaseOpenError.unsupportedSchemaVersion(version)
         }
         try connection.execute("PRAGMA foreign_keys = ON")
@@ -906,7 +963,8 @@ public actor MediaDatabase {
                 bookmark BLOB NOT NULL,
                 is_enabled INTEGER NOT NULL DEFAULT 1 CHECK (is_enabled IN (0, 1)),
                 created_at REAL NOT NULL,
-                last_scan_at REAL
+                last_scan_at REAL,
+                processing_rank INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS media_asset (
@@ -928,6 +986,9 @@ public actor MediaDatabase {
                 last_seen_at REAL NOT NULL,
                 invalidated_at REAL,
                 candidate_duration_ms INTEGER,
+                media_kind TEXT NOT NULL DEFAULT 'video',
+                pixel_width INTEGER NOT NULL DEFAULT 0,
+                pixel_height INTEGER NOT NULL DEFAULT 0,
                 UNIQUE(root_id, relative_path)
             );
             CREATE INDEX IF NOT EXISTS media_asset_root_file_id
@@ -1156,6 +1217,54 @@ public actor MediaDatabase {
                     }
                     try connection.execute("PRAGMA user_version = 9")
                 }
+            }
+        }
+        if version < 10 {
+            // 图片支持：媒体类型与探测得到的像素尺寸。存量行默认
+            // video，与既有数据语义一致。
+            // 注意必须在 `if version < 9` 链之外：v9 库不会再进入那条链，
+            // v10 的 DDL 与版本号也就永远不会执行。
+            try connection.inTransaction {
+                if !(try columnExists(connection, table: "media_asset", column: "media_kind")) {
+                    try connection.execute(
+                        "ALTER TABLE media_asset ADD COLUMN media_kind TEXT NOT NULL DEFAULT 'video'"
+                    )
+                }
+                if !(try columnExists(connection, table: "media_asset", column: "pixel_width")) {
+                    try connection.execute(
+                        "ALTER TABLE media_asset ADD COLUMN pixel_width INTEGER NOT NULL DEFAULT 0"
+                    )
+                }
+                if !(try columnExists(connection, table: "media_asset", column: "pixel_height")) {
+                    try connection.execute(
+                        "ALTER TABLE media_asset ADD COLUMN pixel_height INTEGER NOT NULL DEFAULT 0"
+                    )
+                }
+                try connection.execute("PRAGMA user_version = 10")
+            }
+        }
+        if version < 11 {
+            // 处理队列：媒体库顺序即处理优先级。存量库按 created_at、path
+            // 回填，与既有展示顺序一致；此后 rank 只被两个动作改变——新库
+            // 追加到队尾、用户把某个库移到队首。
+            // 与 v10 同理必须在 `if version < 9` 链之外，v10 库才会进入这里。
+            try connection.inTransaction {
+                if !(try columnExists(connection, table: "library_root", column: "processing_rank")) {
+                    try connection.execute(
+                        "ALTER TABLE library_root ADD COLUMN processing_rank INTEGER NOT NULL DEFAULT 0"
+                    )
+                }
+                try connection.execute(
+                    """
+                    UPDATE library_root SET processing_rank = (
+                        SELECT COUNT(*) FROM library_root other
+                        WHERE other.created_at < library_root.created_at
+                           OR (other.created_at = library_root.created_at
+                               AND other.path < library_root.path)
+                    )
+                    """
+                )
+                try connection.execute("PRAGMA user_version = 11")
             }
         }
         // This index must be created after the V6→V7 ALTER adds `is_active`.

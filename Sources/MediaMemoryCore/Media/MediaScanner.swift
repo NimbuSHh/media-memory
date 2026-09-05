@@ -6,6 +6,7 @@ public enum MediaScanError: Error, LocalizedError, Sendable {
     case unsupportedFileType(String)
     case invalidDuration(String)
     case missingVideoTrack(String)
+    case undecodableImage(String)
 
     public var errorDescription: String? {
         switch self {
@@ -19,6 +20,8 @@ public enum MediaScanError: Error, LocalizedError, Sendable {
             "媒体时长无效：\(path)"
         case let .missingVideoTrack(path):
             "媒体没有视频轨道：\(path)"
+        case let .undecodableImage(path):
+            "图片无法解码或已损坏：\(path)"
         }
     }
 }
@@ -58,9 +61,7 @@ public struct MediaScanEnumeration: Sendable {
 }
 
 public struct MediaScanner: Sendable {
-    public static let supportedExtensions: Set<String> = [
-        "3gp", "avi", "m2ts", "m4v", "mkv", "mov", "mp4", "mts", "webm"
-    ]
+    public static let supportedExtensions: Set<String> = MediaKind.supportedExtensions
 
     public init() {}
 
@@ -362,7 +363,10 @@ public struct MediaScanner: Sendable {
                     isPlayable: probe.isPlayable,
                     fingerprint: fingerprint,
                     status: probe.isPlayable ? .ready : .failed,
-                    errorMessage: probe.isPlayable ? nil : "AVFoundation 判定该媒体不可播放"
+                    errorMessage: probe.isPlayable ? nil : "媒体探测判定该文件不可用",
+                    mediaKind: probe.mediaKind,
+                    pixelWidth: probe.pixelWidth,
+                    pixelHeight: probe.pixelHeight
                 ),
                 error: nil
             )

@@ -1842,6 +1842,259 @@ final class MediaDatabaseTests: XCTestCase {
         )
     }
 
+    // MARK: 处理队列（媒体库顺序即处理优先级）
+
+    /// 建立多根测试库：每个名字一个媒体库，各含一个 10 秒、可直接建库的
+    /// 视频（单段），相对路径即名字，保证库内字母序确定。
+    private func makeLibraryWithQueuedRoots(
+        _ url: URL,
+        rootNames: [String]
+    ) async throws -> (database: MediaDatabase, roots: [LibraryRootRecord]) {
+        let database = try MediaDatabase(url: url)
+        var roots: [LibraryRootRecord] = []
+        for (index, name) in rootNames.enumerated() {
+            let root = try await database.addLibraryRoot(
+                path: temporaryChildPath(url, name: "root-\(name)"),
+                bookmark: Data([UInt8(index + 1)])
+            )
+            try await database.applyScan(
+                rootID: root.id,
+                result: MediaScanResult(
+                    assets: [sampleAsset(
+                        relativePath: "\(name).mp4",
+                        durationMS: 10_000,
+                        fingerprint: "\(name)-fingerprint",
+                        fileIdentifier: "\(name)-file"
+                    )],
+                    unstableFileCount: 0,
+                    skippedFileCount: 0,
+                    errors: []
+                )
+            )
+            roots.append(root)
+        }
+        try await database.reconcileIndexJobs(
+            embeddingModelID: "embedding-model",
+            inputVersion: "pipeline-v1"
+        )
+        return (database, roots)
+    }
+
+    private func temporaryChildPath(_ url: URL, name: String) -> String {
+        url.deletingLastPathComponent().appending(path: name).path
+    }
+
+    private func assetID(
+        _ database: MediaDatabase,
+        relativePath: String
+    ) async throws -> String {
+        let assets = try await database.mediaAssets()
+        return try XCTUnwrap(assets.first { $0.relativePath == relativePath }.map(\.id))
+    }
+
+    func testMigrationBackfillsProcessingRankInCreatedOrder() async throws {
+        let temporary = try TemporaryDirectory()
+        let url = temporary.url.appending(path: "queue.sqlite")
+        var database: MediaDatabase? = try await makeLibraryWithQueuedRoots(
+            url,
+            rootNames: ["a", "b", "c"]
+        ).database
+        database = nil
+
+        do {
+            let legacy = try SQLiteConnection(url: url)
+            try legacy.execute("PRAGMA user_version = 10")
+        }
+
+        let migrated = try MediaDatabase(url: url)
+        let roots = try await migrated.libraryRoots()
+        let migratedVersion = try await migrated.schemaVersion()
+        XCTAssertEqual(migratedVersion, 11)
+        // 回填按 created_at、path 排序，与既有展示顺序一致。
+        XCTAssertEqual(
+            roots.map(\.processingRank),
+            roots.map(\.processingRank).sorted()
+        )
+        XCTAssertEqual(Set(roots.map(\.processingRank)), Set([0, 1, 2]))
+    }
+
+    func testNewLibraryRootsAppendToQueueTailAndUpsertKeepsRank() async throws {
+        let temporary = try TemporaryDirectory()
+        let url = temporary.url.appending(path: "queue.sqlite")
+        let database = try MediaDatabase(url: url)
+        let firstPath = temporaryChildPath(url, name: "root-first")
+        let first = try await database.addLibraryRoot(path: firstPath, bookmark: Data([1]))
+        let second = try await database.addLibraryRoot(
+            path: temporaryChildPath(url, name: "root-second"),
+            bookmark: Data([2])
+        )
+        XCTAssertEqual(first.processingRank, 0)
+        XCTAssertEqual(second.processingRank, 1)
+
+        // 同一路径重连（bookmark 续期）不得重置 rank。
+        let reconnected = try await database.addLibraryRoot(path: firstPath, bookmark: Data([9]))
+        XCTAssertEqual(reconnected.id, first.id)
+        XCTAssertEqual(reconnected.processingRank, 0)
+
+        let third = try await database.addLibraryRoot(
+            path: temporaryChildPath(url, name: "root-third"),
+            bookmark: Data([3])
+        )
+        XCTAssertEqual(third.processingRank, 2)
+    }
+
+    func testProcessingFollowsLibraryQueueOrderAndFrontMoveWins() async throws {
+        let temporary = try TemporaryDirectory()
+        let (database, roots) = try await makeLibraryWithQueuedRoots(
+            temporary.url.appending(path: "queue.sqlite"),
+            rootNames: ["a", "b", "c"]
+        )
+        XCTAssertEqual(roots.map(\.processingRank), [0, 1, 2])
+        let aID = try await assetID(database, relativePath: "a.mp4")
+        let cID = try await assetID(database, relativePath: "c.mp4")
+
+        // 默认按 rank 顺序：先处理最早加入的库。
+        let initialOwner = try await database.activeProcessingAssetID()
+        XCTAssertEqual(initialOwner, aID)
+
+        // 优先处理：最后的库跳到队首，下一个资产来自它。
+        try await database.moveLibraryRootToFront(id: roots[2].id)
+        let prioritizedOwner = try await database.activeProcessingAssetID()
+        XCTAssertEqual(prioritizedOwner, cID)
+    }
+
+    func testPriorityChangeDoesNotPreemptRunningAsset() async throws {
+        let temporary = try TemporaryDirectory()
+        let (database, roots) = try await makeLibraryWithQueuedRoots(
+            temporary.url.appending(path: "queue.sqlite"),
+            rootNames: ["a", "b", "c"]
+        )
+        try await database.moveLibraryRootToFront(id: roots[1].id)
+        let running = try unwrapTarget(try await database.claimNextIndexJob())
+        XCTAssertEqual(running.asset.relativePath, "b.mp4")
+
+        // 队列再怎么变，运行中的资产持有全部车道直到排干。
+        try await database.moveLibraryRootToFront(id: roots[0].id)
+        let stickyOwner = try await database.activeProcessingAssetID()
+        XCTAssertEqual(stickyOwner, running.asset.id)
+        let blockedWhileSticky = try await database.claimNextIndexJob()
+        XCTAssertEqual(blockedWhileSticky, .idle)
+
+        try await database.returnIndexJobToQueue(
+            claim: running.job.claimToken,
+            stage: "test_release"
+        )
+        let next = try unwrapTarget(try await database.claimNextIndexJob())
+        XCTAssertEqual(next.asset.relativePath, "a.mp4")
+    }
+
+    func testCompletedLibraryReentersQueueAtItsRank() async throws {
+        let temporary = try TemporaryDirectory()
+        let (database, roots) = try await makeLibraryWithQueuedRoots(
+            temporary.url.appending(path: "queue.sqlite"),
+            rootNames: ["a", "b", "c"]
+        )
+        // c 优先到队首并完成处理；完成后它离开队列，rank 保留。
+        try await database.moveLibraryRootToFront(id: roots[2].id)
+        let cTarget = try unwrapTarget(try await database.claimNextIndexJob())
+        XCTAssertEqual(cTarget.asset.relativePath, "c.mp4")
+        try await database.commitIndexOutput(
+            claim: cTarget.job.claimToken,
+            segmentID: cTarget.segment.id,
+            output: testIndexOutput(
+                fingerprint: cTarget.asset.fingerprint,
+                framePath: "Frames/c/00.jpg"
+            ),
+            inputVersion: "pipeline-v1"
+        )
+
+        let statesAfterFinish = try await database.libraryRootQueueStates()
+        XCTAssertEqual(statesAfterFinish[roots[2].id]?.pendingJobCount, 0)
+        var ordered = LibraryRootQueue.orderedRoots(
+            roots: try await database.libraryRoots(),
+            states: statesAfterFinish
+        )
+        XCTAssertEqual(ordered.map(\.path).last, roots[2].path)
+
+        // 重新产生任务（手动重跑等）时回到原队列位置：仍排在 a、b 之前。
+        let cAssetID = try await assetID(database, relativePath: "c.mp4")
+        try await database.requeueAssetIndexJobs(assetID: cAssetID)
+        ordered = LibraryRootQueue.orderedRoots(
+            roots: try await database.libraryRoots(),
+            states: try await database.libraryRootQueueStates()
+        )
+        XCTAssertEqual(ordered.first?.path, roots[2].path)
+        let cID = try await assetID(database, relativePath: "c.mp4")
+        let reenteredOwner = try await database.activeProcessingAssetID()
+        XCTAssertEqual(reenteredOwner, cID)
+    }
+
+    func testLibraryRootQueueStatesReflectSchedulableWork() async throws {
+        let temporary = try TemporaryDirectory()
+        let database = try MediaDatabase(url: temporary.url.appending(path: "queue.sqlite"))
+        let root = try await database.addLibraryRoot(
+            path: temporaryChildPath(temporary.url, name: "root-main"),
+            bookmark: Data([1])
+        )
+        try await database.applyScan(
+            rootID: root.id,
+            result: MediaScanResult(
+                assets: [
+                    sampleAsset(
+                        relativePath: "one.mp4",
+                        durationMS: 10_000,
+                        fingerprint: "one-fingerprint",
+                        fileIdentifier: "one-file"
+                    ),
+                    sampleAsset(
+                        relativePath: "two.mp4",
+                        durationMS: 10_000,
+                        fingerprint: "two-fingerprint",
+                        fileIdentifier: "two-file"
+                    )
+                ],
+                unstableFileCount: 0,
+                skippedFileCount: 0,
+                errors: []
+            )
+        )
+        try await database.reconcileIndexJobs(
+            embeddingModelID: "embedding-model",
+            inputVersion: "pipeline-v1"
+        )
+
+        // 每个单段资产一个建库任务。
+        var states = try await database.libraryRootQueueStates()
+        XCTAssertEqual(states[root.id]?.pendingJobCount, 2)
+        XCTAssertNotNil(states[root.id]?.lastJobActivityAt)
+        XCTAssertFalse(states[root.id]?.isComplete ?? true)
+
+        // 用户移除的媒体不再参与队列：任务随排除标记删除。
+        let oneID = try await assetID(database, relativePath: "one.mp4")
+        try await database.removeAsset(assetID: oneID)
+        states = try await database.libraryRootQueueStates()
+        XCTAssertEqual(states[root.id]?.pendingJobCount, 1)
+
+        // 全部任务落定后视为完成；完成时刻即最后一次任务活动。
+        let twoTarget = try unwrapTarget(try await database.claimNextIndexJob())
+        try await database.commitIndexOutput(
+            claim: twoTarget.job.claimToken,
+            segmentID: twoTarget.segment.id,
+            output: testIndexOutput(
+                fingerprint: twoTarget.asset.fingerprint,
+                framePath: "Frames/two/00.jpg"
+            ),
+            inputVersion: "pipeline-v1"
+        )
+        states = try await database.libraryRootQueueStates()
+        XCTAssertEqual(states[root.id]?.pendingJobCount, 0)
+        XCTAssertNotNil(states[root.id]?.lastJobActivityAt)
+        // applyScan 之后的记录才带 lastScanAt；扫描过的库无待处理任务即完成。
+        let allRoots = try await database.libraryRoots()
+        let scannedRoot = try XCTUnwrap(allRoots.first { $0.id == root.id })
+        XCTAssertEqual(LibraryRootQueue.isProcessed(scannedRoot, states: states), true)
+    }
+
     private func unwrapTarget(_ claim: JobClaim) throws -> SegmentIndexTarget {
         guard case .target(let target) = claim else {
             throw XCTSkip("预期可认领任务，实际：\(claim)")

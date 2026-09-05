@@ -1,6 +1,9 @@
 @preconcurrency import AVFoundation
+import AppKit
 import Combine
+import CoreGraphics
 import Foundation
+import ImageIO
 import MediaMemoryCore
 
 struct ModelEndpointDraft: Equatable, Hashable, Sendable {
@@ -62,13 +65,22 @@ struct VideoQueueSummary: Equatable {
     }
 }
 
-/// 侧栏路径统计：视频数、总大小、总时长，加上以视频为单位的处理进度。
+/// 侧栏路径统计：媒体数（视频/图片分开计）、总大小、总时长（只累计
+/// 视频的名义时长之外的真实时长），加上以媒体为单位的处理进度。
 /// 与 `videoQueue` 同一趟汇总产出，共享同一节流刷新节奏。
 struct RootLibraryStatistics: Equatable {
     var videoCount = 0
+    var imageCount = 0
     var totalFileSize: Int64 = 0
     var totalDurationMS: Int64 = 0
     var queue = VideoQueueSummary()
+}
+
+/// 面板活动行的一行状态：正在做什么（isRunning = 转 spinner）或
+/// 为什么停着。由既有各通道状态按优先级派生，见 `AppModel.currentActivity`。
+struct LibraryActivity: Equatable {
+    let text: String
+    let isRunning: Bool
 }
 
 /// 展示用的片段描述：内容 + 两类过期标记。
@@ -110,10 +122,14 @@ private struct PreparedPlayer: @unchecked Sendable {
 @MainActor
 final class AppModel: ObservableObject {
     @Published private(set) var roots: [LibraryRootRecord] = []
+    /// 每个库的处理队列状态（可调度 pending/running 任务数、最后活动时刻）。
+    @Published private(set) var libraryQueueStates: [String: LibraryRootQueueState] = [:]
     @Published private(set) var assets: [MediaAssetRecord] = []
     @Published private(set) var visibleAssetItems: [NumberedMediaAsset] = []
     @Published private(set) var configuration: ModelConfiguration?
     @Published private(set) var player: AVPlayer?
+    /// 图片资产的预览图；与 player 互斥（同一时刻只展示一种媒体）。
+    @Published private(set) var imagePreview: NSImage?
     @Published private(set) var isPlayerLoading = false
     @Published private(set) var playerError: String?
     @Published private(set) var selectedAsset: MediaAssetRecord?
@@ -133,6 +149,8 @@ final class AppModel: ObservableObject {
     )
     @Published private(set) var processingSummaries: [String: AssetProcessingSummary] = [:]
     @Published private(set) var videoQueue = VideoQueueSummary()
+    /// 面板三阶段进度的唯一数据源：媒体口径，与 videoQueue 同一趟汇总算出。
+    @Published private(set) var pipelineProgress = LibraryPipelineProgress()
     @Published private(set) var libraryStatistics = RootLibraryStatistics()
     @Published private(set) var rootStatistics: [String: RootLibraryStatistics] = [:]
     @Published private(set) var failedJobs: [IndexJobRecord] = []
@@ -140,12 +158,29 @@ final class AppModel: ObservableObject {
     @Published var selectedRootID: String? {
         didSet { rebuildVisibleAssetItems() }
     }
+    /// 筛选菜单的候选计数（当前库选择内、全局口径），随列表重建刷新。
+    @Published private(set) var filterCounts = LibraryFilterCounts()
+    /// 媒体列表筛选与排序：任务态，不持久化。作用在当前库选择之上，
+    /// 计数、进度判定与侧栏统计同源（见 LibraryFilter）。
+    @Published var libraryFilter = LibraryFilter() {
+        didSet {
+            guard libraryFilter != oldValue else { return }
+            rebuildVisibleAssetItems()
+        }
+    }
+    @Published var librarySort = LibrarySort() {
+        didSet {
+            guard librarySort != oldValue else { return }
+            rebuildVisibleAssetItems()
+        }
+    }
     @Published var searchQuery = ""
     @Published var settingsDraft = ModelSettingsDraft()
     @Published private(set) var modelTestStates = Dictionary(
         uniqueKeysWithValues: ModelRole.allCases.map { ($0, ModelTestState()) }
     )
     @Published var isSettingsPresented = false
+    @Published var isAgentIntegrationPresented = false
     @Published private(set) var isScanning = false
     @Published private(set) var isIndexing = false
     @Published private(set) var isSearching = false
@@ -156,6 +191,8 @@ final class AppModel: ObservableObject {
     @Published private(set) var isTestingModels = false
     @Published private(set) var startupPhase = AppStartupPhase.loadingLocalData
     @Published private(set) var statusMessage = "正在读取本地数据…"
+    /// 操作回执（"已重新排队…"）：显示数秒后自动消失，新回执顶替旧回执。
+    @Published private(set) var transientNotice: String?
     @Published private(set) var scanStatusMessage = "扫描空闲"
     @Published private(set) var searchStatusMessage = ""
     @Published private(set) var evidenceStatusMessage = "建库空闲"
@@ -215,8 +252,9 @@ final class AppModel: ObservableObject {
     private var evidenceLaneFailure: String?
     private var segmentationLaneFailure: String?
     private var descriptionLaneFailure: String?
-    private var isEvidencePaused = false
-    private var isDescriptionPaused = false
+    /// 处理暂停意图：暂停后车道收尾完成、队列仍待续时，面板据此
+    /// 与按钮图标区分"已暂停"和"空闲"。处理只有一个总开关，不分车道。
+    @Published private(set) var isProcessingPaused = false
     private var isBackgroundControlBarrierActive = false
     /// 源不可用断路的 MainActor 镜像：所有断路变更都经由本类发生，
     /// 车道启动守卫同步读取它，避免在守卫里跨 actor 等待。
@@ -254,16 +292,38 @@ final class AppModel: ObservableObject {
             || !searchResults.isEmpty
     }
 
+    /// 当前库选择下、筛选前的资产数；标题用"媒体（结果/总数）"表达筛选比例。
+    @Published private(set) var scopedAssetCount = 0
+
     private func rebuildVisibleAssetItems() {
-        let filtered: [MediaAssetRecord]
+        let scoped: [MediaAssetRecord]
         if let selectedRootID {
-            filtered = assets.filter { $0.rootID == selectedRootID }
+            scoped = assets.filter { $0.rootID == selectedRootID }
         } else {
-            filtered = assets
+            scoped = assets
         }
-        visibleAssetItems = filtered.enumerated().map {
+        // 只在值真正变化时发布：处理状态每 500ms 节流刷新会走到这里，
+        // 无条件重发会让全窗口跟着每次刷新重渲染，菜单开合明显卡顿。
+        if scopedAssetCount != scoped.count {
+            scopedAssetCount = scoped.count
+        }
+        let matched = scoped.filter { libraryFilter.matches(asset: $0, summary: processingSummaries[$0.id]) }
+        let sorted = librarySort.applied(matched)
+        let items = sorted.enumerated().map {
             NumberedMediaAsset(ordinal: $0.offset + 1, asset: $0.element)
         }
+        if items != visibleAssetItems {
+            visibleAssetItems = items
+        }
+        let counts = LibraryFilterCounts.compute(assets: scoped, summaries: processingSummaries)
+        if counts != filterCounts {
+            filterCounts = counts
+        }
+    }
+
+    /// 清除全部筛选条件。排序是独立意图，不在其列。
+    func clearLibraryFilter() {
+        libraryFilter = LibraryFilter()
     }
 
     /// Serializes library-changing commands while leaving the main actor free at every wait.
@@ -273,7 +333,7 @@ final class AppModel: ObservableObject {
         operation: @escaping @MainActor (AppModel) async throws -> Void
     ) {
         guard libraryTask == nil, settingsSaveTask == nil else {
-            statusMessage = "已有媒体库操作正在进行，请稍候"
+            postTransientNotice("已有媒体库操作正在进行，请稍候")
             return
         }
         libraryOperationGeneration += 1
@@ -286,7 +346,7 @@ final class AppModel: ObservableObject {
                 try await operation(self)
             } catch is CancellationError {
                 if self.libraryOperationGeneration == generation {
-                    self.statusMessage = "操作已停止"
+                    self.postTransientNotice("操作已停止")
                 }
             } catch {
                 if self.libraryOperationGeneration == generation {
@@ -399,15 +459,17 @@ final class AppModel: ObservableObject {
             }
             model.invalidateSearchAfterLibraryChange()
             if model.segmenter != nil { try await model.prepareIndexQueue(autoStart: true) }
-            model.statusMessage = cleanupWarning.map {
-                "已移除 \(root.name)；部分派生文件将在下次启动重试清理：\($0)"
-            } ?? "已从媒体库移除：\(root.name)"
+            model.postTransientNotice(
+                cleanupWarning.map {
+                    "已移除 \(root.name)；部分派生文件将在下次启动重试清理：\($0)"
+                } ?? "已从媒体库移除：\(root.name)"
+            )
         }
     }
 
     /// 移除单个视频：保留排除标记防止目录扫描再次纳入，删除其全部派生数据。
     func removeAsset(_ asset: MediaAssetRecord) {
-        runLibraryOperation(status: "正在移除视频…") { model in
+        runLibraryOperation(status: "正在移除媒体…") { model in
             guard let database = model.database,
                   let sourceCache = model.sourceCache,
                   let workRoot = model.workRoot else { return }
@@ -432,9 +494,11 @@ final class AppModel: ObservableObject {
             try await model.refreshLibrary()
             model.invalidateSearchAfterLibraryChange()
             if model.segmenter != nil { try await model.prepareIndexQueue(autoStart: true) }
-            model.statusMessage = cleanupWarning.map {
-                "已移除 \(asset.filename)；部分派生文件将在下次启动重试清理：\($0)"
-            } ?? "已从媒体库移除：\(asset.filename)"
+            model.postTransientNotice(
+                cleanupWarning.map {
+                    "已移除 \(asset.filename)；部分派生文件将在下次启动重试清理：\($0)"
+                } ?? "已从媒体库移除：\(asset.filename)"
+            )
         }
     }
 
@@ -447,7 +511,7 @@ final class AppModel: ObservableObject {
             try await database.requeueAssetIndexJobs(assetID: asset.id)
             try await model.prepareIndexQueue(autoStart: true)
             model.loadAssetDetail(for: asset)
-            model.statusMessage = "已把 \(asset.filename) 重新排队建库"
+            model.postTransientNotice("已把 \(asset.filename) 重新排队建库")
         }
     }
 
@@ -458,7 +522,7 @@ final class AppModel: ObservableObject {
             try await database.requeueSegmentIndexJob(segmentID: segment.id)
             try await model.prepareIndexQueue(autoStart: true)
             if let asset = model.selectedAsset { model.loadAssetDetail(for: asset) }
-            model.statusMessage = "已把片段 \(segment.ordinal + 1) 重新排队"
+            model.postTransientNotice("已把片段 \(segment.ordinal + 1) 重新排队")
         }
     }
 
@@ -470,16 +534,20 @@ final class AppModel: ObservableObject {
             model.segmentDescriptions[segmentID] = nil
             try await model.prepareIndexQueue(autoStart: true)
             if let asset = model.selectedAsset { model.loadAssetDetail(for: asset) }
-            model.statusMessage = "描述已重新排队"
+            model.postTransientNotice("描述已重新排队")
         }
     }
 
     // MARK: 描述手动重跑（prompt/模型变更不再自动触发）
 
-    private func displayed(_ cached: CachedSegmentDescription) -> DisplayedSegmentDescription {
+    /// 判定描述的展示状态：配置性过期按媒体类型比较各自的当前 prompt。
+    private func displayed(
+        _ cached: CachedSegmentDescription,
+        mediaKind: MediaKind
+    ) -> DisplayedSegmentDescription {
         DisplayedSegmentDescription(
             cached: cached,
-            isConfigStale: cached.promptVersion != DescriptionService.promptVersion
+            isConfigStale: cached.promptVersion != DescriptionService.promptVersion(for: mediaKind)
                 || cached.modelID != configuration?.description.derivationID,
             isEvidenceStale: !cached.isEvidenceCurrent
         )
@@ -493,7 +561,7 @@ final class AppModel: ObservableObject {
             model.segmentDescriptions = [:]
             try await model.prepareIndexQueue(autoStart: true)
             model.loadAssetDetail(for: asset)
-            model.statusMessage = "已把 \(asset.filename) 的描述重新排队"
+            model.postTransientNotice("已把 \(asset.filename) 的描述重新排队")
         }
     }
 
@@ -503,24 +571,25 @@ final class AppModel: ObservableObject {
             guard let database = model.database, let configuration = model.configuration else { return }
             try await database.requeueStaleDescriptions(
                 descriptionModelID: configuration.description.derivationID,
-                promptVersion: DescriptionService.promptVersion
+                videoPromptVersion: DescriptionService.promptVersion(for: .video),
+                imagePromptVersion: DescriptionService.promptVersion(for: .image)
             )
             model.segmentDescriptions = [:]
             try await model.refreshJobs()
             try await model.prepareIndexQueue(autoStart: true)
             if let asset = model.selectedAsset { model.loadAssetDetail(for: asset) }
-            model.statusMessage = "旧版描述已重新排队"
+            model.postTransientNotice("旧版描述已重新排队")
         }
     }
 
     /// 右键单个媒体库条目重新扫描（完整探测；扫描进行中则排队）。
     func rescanRoot(_ root: LibraryRootRecord) {
         guard database != nil else {
-            statusMessage = startupPhase == .loadingLocalData ? "正在读取本地数据…" : "数据库尚未就绪"
+            postTransientNotice(startupPhase == .loadingLocalData ? "正在读取本地数据…" : "数据库尚未就绪")
             return
         }
         guard libraryTask == nil, settingsSaveTask == nil else {
-            statusMessage = "已有媒体库操作正在进行，请稍候"
+            postTransientNotice("已有媒体库操作正在进行，请稍候")
             return
         }
         enqueueScan(roots: [root], mode: .full)
@@ -548,7 +617,7 @@ final class AppModel: ObservableObject {
                 model.startIndexing()
             }
             try await model.refreshLibrary()
-            model.statusMessage = "已重新授权：\(root.name)"
+            model.postTransientNotice("已重新授权：\(root.name)")
         }
     }
 
@@ -566,45 +635,32 @@ final class AppModel: ObservableObject {
     var isEvidenceIndexing: Bool { segmentationTask != nil || indexTask != nil }
     var isDescriptionIndexing: Bool { describeTask != nil }
 
-    func startEvidenceProcessing() {
+    /// 处理总开关的启动侧：清三条车道的失败态并全部启动。
+    /// 车道各自有空队列守卫，没活的启动是空操作。
+    func startProcessing() {
         guard !isSourceCircuitOpen else {
-            statusMessage = "媒体源不可用：请先恢复该源（重试读取源 / 重新授权 / 重新扫描）"
+            postTransientNotice("媒体源不可用：请先恢复该源（重试读取源 / 重新授权 / 重新扫描）")
             return
         }
-        isEvidencePaused = false
-        evidenceLaneFailure = nil
+        isProcessingPaused = false
         segmentationLaneFailure = nil
+        evidenceLaneFailure = nil
+        descriptionLaneFailure = nil
         clearBackgroundWarning(id: "lane.segmentation")
         clearBackgroundWarning(id: "lane.evidence")
-        clearBackgroundWarning(id: "lane.queue")
-        startSegmentationLane()
-        startEvidenceLane()
-    }
-
-    func startDescriptionProcessing() {
-        guard !isSourceCircuitOpen else {
-            statusMessage = "媒体源不可用：请先恢复该源（重试读取源 / 重新授权 / 重新扫描）"
-            return
-        }
-        isDescriptionPaused = false
-        descriptionLaneFailure = nil
         clearBackgroundWarning(id: "lane.description")
         clearBackgroundWarning(id: "lane.queue")
-        startDescriptionLane()
+        startIndexing()
     }
 
-    func pauseEvidenceProcessing() {
-        guard segmentationTask != nil || indexTask != nil else { return }
-        isEvidencePaused = true
-        evidenceStatusMessage = "正在暂停建库…"
+    /// 处理总开关的暂停侧：三条车道一起收尾，队列原样保留。
+    func pauseProcessing() {
+        guard segmentationTask != nil || indexTask != nil || describeTask != nil else { return }
+        isProcessingPaused = true
+        evidenceStatusMessage = "正在暂停处理…"
+        descriptionStatusMessage = "正在暂停处理…"
         segmentationTask?.cancel()
         indexTask?.cancel()
-    }
-
-    func pauseDescriptionProcessing() {
-        guard describeTask != nil else { return }
-        isDescriptionPaused = true
-        descriptionStatusMessage = "正在暂停描述…"
         describeTask?.cancel()
     }
 
@@ -621,7 +677,7 @@ final class AppModel: ObservableObject {
                 model.indexingProgress = try await indexer.retryFailed()
             }
             try await model.prepareIndexQueue(autoStart: false)
-            model.startEvidenceProcessing()
+            model.startProcessing()
         }
     }
 
@@ -633,7 +689,7 @@ final class AppModel: ObservableObject {
             try await database.recoverInterruptedJobs(kind: .describeSegment)
             model.describeProgress = try await describeQueue.retryFailed()
             try await model.prepareIndexQueue(autoStart: false)
-            model.startDescriptionProcessing()
+            model.startProcessing()
         }
     }
 
@@ -726,7 +782,10 @@ final class AppModel: ObservableObject {
             )
             guard !Task.isCancelled else { return }
             if self.selectedResult?.segment.id == result.segment.id, let cached {
-                self.segmentDescriptions[result.segment.id] = self.displayed(cached)
+                self.segmentDescriptions[result.segment.id] = self.displayed(
+                    cached,
+                    mediaKind: result.asset.mediaKind
+                )
             }
             self.selectedDescriptionTask = nil
         }
@@ -775,7 +834,7 @@ final class AppModel: ObservableObject {
         settingsKeyLoadTask = Task { [weak self] in
             let credentials: ModelCredentials
             do {
-                credentials = try await KeychainStore.loadModelCredentialsAsync(
+                credentials = try await ModelCredentialStore.loadModelCredentialsAsync(
                     for: credentialRoles
                 )
             } catch is CancellationError {
@@ -790,7 +849,7 @@ final class AppModel: ObservableObject {
                     detail: "请在模型设置中重新输入需要 Bearer 鉴权的 API key。\n\(error.localizedDescription)"
                 )
                 self.settingsCredentialWarning =
-                    "无法读取旧版模型凭据。请重新输入；保存时 macOS 可能要求授权迁移。\n\(error.localizedDescription)"
+                    "无法读取旧版凭据。可在系统弹窗中允许访问完成一次性迁移，或在模型设置中重新输入。\n\(error.localizedDescription)"
                 return
             }
             guard !Task.isCancelled, let self, self.isSettingsPresented else { return }
@@ -809,7 +868,7 @@ final class AppModel: ObservableObject {
               libraryTask == nil,
               !isSettingsLoading,
               !isTestingModels else {
-            statusMessage = isSettingsLoading ? "正在读取钥匙串…" : "另一项设置或媒体库操作尚未完成"
+            postTransientNotice(isSettingsLoading ? "正在读取模型密钥…" : "另一项设置或媒体库操作尚未完成")
             return
         }
         let draft = settingsDraft
@@ -842,7 +901,7 @@ final class AppModel: ObservableObject {
                 self?.settingsKeyLoadTask = nil
             }
             do {
-                let credentials = try await KeychainStore.loadModelCredentialsAsync(for: [role])
+                let credentials = try await ModelCredentialStore.loadModelCredentialsAsync(for: [role])
                 guard !Task.isCancelled, let self, self.isSettingsPresented,
                       self.settingsDraft.endpoint(for: role).authentication == .bearer else {
                     return
@@ -855,7 +914,7 @@ final class AppModel: ObservableObject {
             } catch {
                 guard let self else { return }
                 self.settingsCredentialWarning =
-                    "无法读取旧版模型凭据。请重新输入；保存时 macOS 可能要求授权迁移。\n\(error.localizedDescription)"
+                    "无法读取旧版凭据。可在系统弹窗中允许访问完成一次性迁移，或在模型设置中重新输入。\n\(error.localizedDescription)"
             }
         }
     }
@@ -1077,6 +1136,61 @@ final class AppModel: ObservableObject {
         }
     }
 
+    // MARK: 面板活动与回执
+
+    /// 操作回执：面板显示数秒后自动消失；连发时新回执顶替旧回执。
+    func postTransientNotice(_ text: String) {
+        transientNoticeTask?.cancel()
+        transientNotice = text
+        transientNoticeTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(5))
+            guard !Task.isCancelled else { return }
+            self?.transientNotice = nil
+        }
+    }
+
+    private var transientNoticeTask: Task<Void, Never>?
+
+    /// 待处理媒体数（有任务排队或尚未入队）。活动行的"为什么停着"用
+    /// 媒体口径计数，与面板其余数字同一分母。
+    var pendingMediaCount: Int { videoQueue.waiting + videoQueue.notStarted }
+
+    /// 面板活动行：把各通道状态收敛为一行"正在做什么/为什么停着"。
+    /// 车道与扫描只在运行中可见——槽位里遗留的"已处理到队尾"等收尾
+    /// 文案不再出现在面板上；运行结束的摘要改由 `postTransientNotice` 回执。
+    var currentActivity: LibraryActivity? {
+        if startupPhase != .ready {
+            return LibraryActivity(
+                text: statusMessage,
+                isRunning: startupPhase == .loadingLocalData
+            )
+        }
+        if isLibraryBusy || isSavingSettings {
+            return LibraryActivity(text: statusMessage, isRunning: true)
+        }
+        if isScanning {
+            return LibraryActivity(text: scanStatusMessage, isRunning: true)
+        }
+        if isEvidenceIndexing {
+            return LibraryActivity(text: evidenceStatusMessage, isRunning: true)
+        }
+        if isDescriptionIndexing {
+            return LibraryActivity(text: descriptionStatusMessage, isRunning: true)
+        }
+        if isSearching {
+            return LibraryActivity(text: "正在搜索…", isRunning: true)
+        }
+        if pendingMediaCount > 0 {
+            return LibraryActivity(
+                // 打开时车道不会自动启动，这里也覆盖"从未启动"的状态，
+                // 文案不能暗示"曾经运行、被暂停"。
+                text: "处理未运行 · \(pendingMediaCount.formatted()) 个媒体排队中",
+                isRunning: false
+            )
+        }
+        return nil
+    }
+
     /// 启动只强依赖本地数据（配置、数据库、库列表），且这些读取也
     /// 全部在后台执行；清扫、书签解析、服务配置等维护工作随后异步进行，
     /// 任何一步慢都不会阻塞界面。
@@ -1130,7 +1244,7 @@ final class AppModel: ObservableObject {
                 recordBackgroundWarning(
                     id: "settings.authentication-migration",
                     title: "请确认模型鉴权方式",
-                    detail: "旧配置没有记录鉴权模式。为避免不必要地访问钥匙串，模型服务会等待你在“模型设置”中确认并保存。"
+                    detail: "旧配置没有记录鉴权模式。为避免不必要的凭据读取，模型服务会等待你在“模型设置”中确认并保存。"
                 )
             }
         } catch {
@@ -1187,28 +1301,19 @@ final class AppModel: ObservableObject {
         )
     }
 
-    /// 启动轻量刷新：给"文件已从磁盘消失/变化"一个常规检测时机（此前
-    /// 只有添加媒体会触发扫描，缺失无从发现）。只做目录枚举 + 元数据
-    /// 比对，仅新增或变化的文件会被探测；与其他扫描请求共用串行队列。
-    private func enqueueStartupRefresh() {
-        let targets = roots.filter(\.isEnabled)
-        guard !targets.isEmpty else { return }
-        enqueueScan(roots: targets, mode: .refresh)
-    }
-
-    /// 后台维护只处理本机派生数据与模型运行时。媒体书签解析保持在需要时
-    /// 才发生（轻量刷新、源缓存或播放）；启动刷新只做目录枚举与 stat，
-    /// 不逐文件打开媒体，对 NAS 的扰动远小于旧的全量扫描。
+    /// 后台维护只处理本机派生数据与模型运行时：崩溃恢复只改数据库里的
+    /// 运行中标记，队列协调与临时文件清理只碰本地派生数据。打开时绝不
+    /// 自动开始扫描或处理——媒体书签解析保持在需要时才发生（手动扫描、
+    /// 添加媒体、源缓存或播放）。
     private func bootstrapMaintenance(generation: Int) async {
         guard let database, let searchDatabase, let sourceCache, let workRoot else { return }
-        enqueueStartupRefresh()
         do {
             try await recoverInterruptedJobsIfNeeded()
             try Task.checkCancellation()
             segmentationProgress = try await segmenter?.prepareQueue() ?? segmentationProgress
             try Task.checkCancellation()
             // Queue reconciliation is local database maintenance, not model
-            // work. Run it before Keychain/runtime setup so legacy saved
+            // work. Run it before credential/runtime setup so legacy saved
             // descriptions recover immediately even when models are offline.
             try await database.reconcileDescribeJobs()
             try await refreshJobs()
@@ -1251,7 +1356,7 @@ final class AppModel: ObservableObject {
             let roles = configuration.credentialRoles
             let credentials = roles.isEmpty
                 ? ModelCredentials()
-                : try await KeychainStore.loadModelCredentialsAsync(for: roles)
+                : try await ModelCredentialStore.loadModelCredentialsAsync(for: roles)
             for role in roles where credentials[role].isEmpty {
                 throw AppLifecycleError.missingBearerCredential(role)
             }
@@ -1267,9 +1372,9 @@ final class AppModel: ObservableObject {
             guard generation == serviceGeneration else { return }
             install(services)
             clearBackgroundWarning(id: "maintenance.models")
-            try await prepareIndexQueue(
-                autoStart: scanTask == nil && libraryTask == nil && settingsSaveTask == nil
-            )
+            // 打开时不自动开始处理：车道只由用户显式启动（面板 ▶、重试、
+            // 添加媒体、重新扫描等）。这里只做队列协调，把进度数字摆正。
+            try await prepareIndexQueue(autoStart: false)
         } catch is CancellationError {
             if generation == serviceGeneration { maintenanceTask = nil }
             return
@@ -1405,33 +1510,20 @@ final class AppModel: ObservableObject {
             try Task.checkCancellation()
             let previousRoles = previousConfiguration.credentialRoles
             let touchedCredentialRoles = previousRoles.union(newConfiguration.credentialRoles)
-            let previousCredentials: ModelCredentials?
-            let requiresACLReplacement: Bool
-            do {
-                previousCredentials = try await KeychainStore.loadModelCredentialsAsync(
+            let previousCredentials = touchedCredentialRoles.isEmpty
+                ? nil
+                : try? await ModelCredentialStore.loadModelCredentialsAsync(
                     for: touchedCredentialRoles
                 )
-                requiresACLReplacement = false
-            } catch let error as KeychainError where error.isAccessDenied {
-                previousCredentials = nil
-                requiresACLReplacement = true
-            }
             do {
-                if requiresACLReplacement {
-                    try await KeychainStore.replaceInaccessibleModelCredentialsAsync(
-                        newCredentials,
-                        for: touchedCredentialRoles
-                    )
-                } else {
-                    try await KeychainStore.saveModelCredentialsAsync(
-                        newCredentials,
-                        for: touchedCredentialRoles
-                    )
-                }
+                try await ModelCredentialStore.saveModelCredentialsAsync(
+                    newCredentials,
+                    for: touchedCredentialRoles
+                )
                 try await ModelConfigurationStore.saveAsync(newConfiguration)
             } catch {
                 if let previousCredentials {
-                    try? await KeychainStore.saveModelCredentialsAsync(
+                    try? await ModelCredentialStore.saveModelCredentialsAsync(
                         previousCredentials,
                         for: touchedCredentialRoles
                     )
@@ -1460,16 +1552,13 @@ final class AppModel: ObservableObject {
             descriptionLaneFailure = nil
             resetModelTestStates()
             isSettingsPresented = false
-            statusMessage = "模型设置已保存"
+            postTransientNotice("模型设置已保存")
             try await prepareIndexQueue(autoStart: false)
-            if !touchedCredentialRoles.isEmpty {
-                await KeychainStore.deleteLegacyOMLXKeyAsync()
-            }
         } catch is CancellationError {
-            statusMessage = "模型设置保存已停止"
+            postTransientNotice("模型设置保存已停止")
         } catch {
             settingsCredentialWarning = error.localizedDescription
-            statusMessage = "模型设置尚未保存"
+            postTransientNotice("模型设置尚未保存")
         }
     }
 
@@ -1536,6 +1625,7 @@ final class AppModel: ObservableObject {
         try Task.checkCancellation()
         guard generation == libraryRefreshGeneration else { return }
         roots = snapshot.roots
+        libraryQueueStates = snapshot.queueStates
         assets = snapshot.assets
         rebuildVisibleAssetItems()
         applyProcessingSummaries(snapshot.processingSummaries)
@@ -1547,13 +1637,41 @@ final class AppModel: ObservableObject {
         }
     }
 
+    // MARK: 处理队列
+
+    /// 处理队列：未完成处理的库，按 rank 从前到后。展示顺序即调度顺序。
+    var queuedRoots: [LibraryRootRecord] {
+        LibraryRootQueue.orderedRoots(roots: roots, states: libraryQueueStates)
+            .filter { !LibraryRootQueue.isProcessed($0, states: libraryQueueStates) }
+    }
+
+    /// 已完成处理的库：按完成时刻倒序，从未产生任务的库排最后。
+    var completedRoots: [LibraryRootRecord] {
+        LibraryRootQueue.orderedRoots(roots: roots, states: libraryQueueStates)
+            .filter { LibraryRootQueue.isProcessed($0, states: libraryQueueStates) }
+    }
+
+    /// 把一个库移到处理队列最前。单行 UPDATE，不打断扫描与进行中的任务；
+    /// 当前资产（单个视频/图片）处理完后，下一个资产即来自该库。
+    func prioritizeRoot(_ root: LibraryRootRecord) {
+        runLibraryOperation(status: "正在调整处理队列…") { model in
+            guard let database = model.database else { return }
+            try await database.moveLibraryRootToFront(id: root.id)
+            try await model.refreshLibrary()
+            model.postTransientNotice("已将 \(root.name) 移到处理队列最前")
+        }
+    }
+
     private func refreshJobs() async throws {
         guard let database = readDatabase else { return }
         jobsRefreshGeneration += 1
         let generation = jobsRefreshGeneration
         async let dashboard = database.jobDashboardSnapshot(
             descriptionModelID: configuration?.description.derivationID,
-            promptVersion: configuration == nil ? nil : DescriptionService.promptVersion
+            videoPromptVersion: configuration == nil
+                ? nil : DescriptionService.promptVersion(for: .video),
+            imagePromptVersion: configuration == nil
+                ? nil : DescriptionService.promptVersion(for: .image)
         )
         async let segmentation = database.segmentationProgress()
         let snapshot = try await dashboard
@@ -1582,19 +1700,29 @@ final class AppModel: ObservableObject {
     private func applyProcessingSummaries(
         _ summaries: [String: AssetProcessingSummary]
     ) {
-        processingSummaries = summaries
+        // 四个发布点全部等值守卫：500ms 节流刷新在队列静默时结果不变，
+        // 不发就没有下游重渲染；变化时仍然每处都更新。
+        if processingSummaries != summaries {
+            processingSummaries = summaries
+        }
 
         var overall = RootLibraryStatistics()
         var perRoot: [String: RootLibraryStatistics] = [:]
         for asset in assets {
             var rootStats = perRoot[asset.rootID] ?? RootLibraryStatistics()
-            rootStats.videoCount += 1
+            // 图片的名义时长不进总时长统计；视频/图片分开计数。
+            if asset.hasTimeline {
+                rootStats.videoCount += 1
+                rootStats.totalDurationMS += asset.durationMS
+                overall.videoCount += 1
+                overall.totalDurationMS += asset.durationMS
+            } else {
+                rootStats.imageCount += 1
+                overall.imageCount += 1
+            }
             rootStats.totalFileSize += asset.fileSize
-            rootStats.totalDurationMS += asset.durationMS
-            overall.videoCount += 1
             overall.totalFileSize += asset.fileSize
-            overall.totalDurationMS += asset.durationMS
-            switch Self.videoQueueBucket(summaries[asset.id]) {
+            switch AssetProcessingBucket.of(summaries[asset.id]) {
             case .inProgress:
                 rootStats.queue.inProgress += 1
                 overall.queue.inProgress += 1
@@ -1616,45 +1744,29 @@ final class AppModel: ObservableObject {
         overall.queue.total = assets.count
         for (rootID, stats) in perRoot {
             var updated = stats
-            updated.queue.total = updated.videoCount
+            // 每库分母与面板总口径一致：全部媒体（视频+图片）。
+            updated.queue.total = updated.videoCount + updated.imageCount
             perRoot[rootID] = updated
         }
-        videoQueue = overall.queue
-        libraryStatistics = overall
-        rootStatistics = perRoot
-    }
-
-    /// 以视频为单位的处理分类，底部队列总览与侧栏路径统计共用，
-    /// 保证同一份数据在两处显示完全一致。
-    private static func videoQueueBucket(
-        _ summary: AssetProcessingSummary?
-    ) -> VideoQueueBucket {
-        guard let summary else { return .notStarted }
-        if summary.segmentationStatus == .running
-            || summary.evidenceRunning || summary.describeRunning {
-            return .inProgress
+        if videoQueue != overall.queue {
+            videoQueue = overall.queue
         }
-        if summary.failedCount > 0 { return .failed }
-        if summary.segmentationStatus == .pending
-            || summary.evidencePending > 0 || summary.describePending > 0 {
-            return .waiting
+        let progress = LibraryPipelineProgress.compute(
+            assets: assets,
+            summaries: summaries
+        )
+        if pipelineProgress != progress {
+            pipelineProgress = progress
         }
-        guard summary.totalSegments > 0 else { return .notStarted }
-        if summary.evidenceSucceeded >= summary.totalSegments,
-           summary.describeSucceeded >= summary.totalSegments {
-            return .completed
+        if libraryStatistics != overall {
+            libraryStatistics = overall
         }
-        // 车道都空闲但产物不完整（例如描述任务缺队）：
-        // 等待 reconcile 补齐，期间按待处理显示，不误报完成。
-        return .waiting
-    }
-
-    private enum VideoQueueBucket {
-        case inProgress
-        case failed
-        case waiting
-        case completed
-        case notStarted
+        if rootStatistics != perRoot {
+            rootStatistics = perRoot
+        }
+        // 处理进度是节流刷新的；进度筛选依赖同一份汇总，必须在汇总
+        // 变化后重建列表，"处理中"里的资产完成时才会移出筛选结果。
+        rebuildVisibleAssetItems()
     }
 
     private func prepareIndexQueue(autoStart: Bool) async throws {
@@ -1771,16 +1883,19 @@ final class AppModel: ObservableObject {
                 )
             }
             scanStatusMessage = request.mode == .full
-                ? "扫描完成：\(assets.count) 个视频"
-                : "媒体库检查完成：\(assets.count) 个视频"
+                ? "扫描完成：\(assets.count) 个媒体"
+                : "媒体库检查完成：\(assets.count) 个媒体"
+            postTransientNotice(scanStatusMessage)
             if segmenter != nil {
                 try await prepareIndexQueue(autoStart: true)
             }
         } catch is CancellationError {
             wasCancelled = true
             scanStatusMessage = "扫描已停止；已提交的数据保持完整"
+            postTransientNotice(scanStatusMessage)
         } catch {
             scanStatusMessage = "扫描失败：\(error.localizedDescription)"
+            postTransientNotice(scanStatusMessage)
             recordBackgroundWarning(id: "scan", title: "扫描失败", detail: error.localizedDescription)
         }
     }
@@ -1793,7 +1908,7 @@ final class AppModel: ObservableObject {
     private func startSegmentationLane() {
         guard !isBackgroundControlBarrierActive,
               !isSourceCircuitOpen,
-              !isEvidencePaused,
+              !isProcessingPaused,
               segmentationLaneFailure == nil,
               segmentationTask == nil,
               // Do not cache once for segmentation and then again after model
@@ -1803,7 +1918,7 @@ final class AppModel: ObservableObject {
               let segmenter,
               segmentationProgress.pending > 0 else { return }
         isIndexing = true
-        evidenceStatusMessage = "正在分析视频内容边界…"
+        evidenceStatusMessage = "正在分析媒体内容边界…"
         segmentationEventGeneration += 1
         let generation = segmentationEventGeneration
         segmentationTask = Task(priority: .utility) { [weak self] in
@@ -1829,7 +1944,7 @@ final class AppModel: ObservableObject {
     private func startEvidenceLane() {
         guard !isBackgroundControlBarrierActive,
               !isSourceCircuitOpen,
-              !isEvidencePaused,
+              !isProcessingPaused,
               evidenceLaneFailure == nil,
               indexTask == nil,
               let indexer,
@@ -1865,7 +1980,7 @@ final class AppModel: ObservableObject {
         // 因此空闲时用实时查询决定是否需要启动。
         guard !isBackgroundControlBarrierActive,
               !isSourceCircuitOpen,
-              !isDescriptionPaused,
+              !isProcessingPaused,
               descriptionLaneFailure == nil,
               describeTask == nil,
               let describeQueue else { return }
@@ -1940,7 +2055,7 @@ final class AppModel: ObservableObject {
             title: "媒体源暂时不可访问：\(root?.name ?? error.rootID)",
             detail: "\(root?.path ?? "")\n处理已暂停，未产生失败任务；源恢复后可继续。\n\(error.errorDescription ?? "")\n恢复方式：右键该媒体库“重新授权”或“重新扫描”，或点击“重试读取源”。"
         )
-        statusMessage = "媒体源不可用，处理已暂停"
+        postTransientNotice("媒体源不可用，处理已暂停")
         return disposition
     }
 
@@ -1978,7 +2093,7 @@ final class AppModel: ObservableObject {
             for warning in self.backgroundWarnings where warning.id.hasPrefix("source.") {
                 self.clearBackgroundWarning(id: warning.id)
             }
-            self.statusMessage = "已重试媒体源，处理继续"
+            self.postTransientNotice("已重试媒体源，处理继续")
             self.startIndexing()
         }
     }
@@ -2093,9 +2208,13 @@ final class AppModel: ObservableObject {
         } else if cancelled {
             if indexTask == nil { evidenceStatusMessage = "建库已暂停" }
         } else if let summary, summary.failed > 0 {
-            if indexTask == nil { evidenceStatusMessage = "语义分片完成，\(summary.failed) 个视频失败" }
+            if indexTask == nil {
+                evidenceStatusMessage = "内容分片完成，\(summary.failed) 个媒体失败"
+                postTransientNotice(evidenceStatusMessage)
+            }
         } else if indexTask == nil {
-            evidenceStatusMessage = "视频分片已处理到当前队尾"
+            evidenceStatusMessage = "内容分片完成，队列已清空"
+            postTransientNotice(evidenceStatusMessage)
         }
         if error == nil {
             clearBackgroundWarning(id: "lane.segmentation")
@@ -2191,13 +2310,15 @@ final class AppModel: ObservableObject {
             } else {
                 descriptionStatusMessage = message
             }
+            postTransientNotice(message)
         } else {
-            message = "\(laneName)已处理到当前队尾"
+            message = "\(laneName)完成，队列已清空"
             if lane == .evidence {
                 evidenceStatusMessage = message
             } else {
                 descriptionStatusMessage = message
             }
+            postTransientNotice(message)
         }
         if error == nil {
             clearBackgroundWarning(
@@ -2268,7 +2389,7 @@ final class AppModel: ObservableObject {
         } catch {
             recordBackgroundWarning(
                 id: "maintenance.source-cache",
-                title: "本地视频缓存尚未清理",
+                title: "本地媒体缓存尚未清理",
                 detail: error.localizedDescription
             )
             return false
@@ -2290,7 +2411,7 @@ final class AppModel: ObservableObject {
                 guard generation == self.detailGeneration,
                       self.selectedAsset?.id == asset.id,
                       self.selectedResult == nil else { return }
-                let cached = descriptions.mapValues { self.displayed($0) }
+                let cached = descriptions.mapValues { self.displayed($0, mediaKind: asset.mediaKind) }
                 self.assetDetail = detail
                 self.segmentDescriptions = cached
                 self.assetDetailLoadTask = nil
@@ -2322,6 +2443,7 @@ final class AppModel: ObservableObject {
         player?.pause()
         player = nil
         playerAssetID = nil
+        imagePreview = nil
         isPlayerLoading = false
         playerError = nil
     }
@@ -2337,11 +2459,47 @@ final class AppModel: ObservableObject {
 
     /// 播放器资产准备与可播放性检查都在异步 AVFoundation API 中完成；
     /// 主线程只接收最终播放器，较慢或离线的远程卷不会冻结界面。
+    /// 图片资产走独立的预览分支：解码降采样为 CGImage，不进入播放器状态。
     private func play(asset: MediaAssetRecord, startMS: Int64) {
         selectedAsset = asset
         playerPreparationTask?.cancel()
         playerGeneration += 1
         let generation = playerGeneration
+        if asset.mediaKind == .image {
+            player?.pause()
+            player = nil
+            playerAssetID = nil
+            playerError = nil
+            imagePreview = nil
+            guard asset.status == .ready, asset.isPlayable else {
+                isPlayerLoading = false
+                playerError = asset.errorMessage ?? "该图片当前不可用。"
+                return
+            }
+            isPlayerLoading = true
+            playerPreparationTask = Task { [weak self] in
+                guard let self else { return }
+                do {
+                    _ = try await self.authorizeLibrary(for: asset)
+                    let url = URL(fileURLWithPath: asset.standardizedPath)
+                    let image = try await Self.prepareImagePreview(url: url)
+                    try Task.checkCancellation()
+                    guard self.playerGeneration == generation,
+                          self.selectedAsset?.id == asset.id else { return }
+                    self.imagePreview = image
+                    self.isPlayerLoading = false
+                } catch is CancellationError {
+                    return
+                } catch {
+                    guard self.playerGeneration == generation else { return }
+                    self.imagePreview = nil
+                    self.isPlayerLoading = false
+                    self.playerError = error.localizedDescription
+                }
+            }
+            return
+        }
+        imagePreview = nil
         guard asset.status == .ready, asset.isPlayable else {
             player = nil
             playerAssetID = nil
@@ -2397,6 +2555,26 @@ final class AppModel: ObservableObject {
             return PreparedPlayer(player: AVPlayer(playerItem: AVPlayerItem(asset: asset)))
         }
         return prepared.player
+    }
+
+    /// 图片预览解码上限 2560 像素：足以全屏查看，超大多图不占满内存。
+    private nonisolated static func prepareImagePreview(url: URL) async throws -> NSImage {
+        let image: CGImage = try await AsyncTimeout.run(for: .seconds(30), operationName: "打开图片") {
+            guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+                  let decoded = CGImageSourceCreateThumbnailAtIndex(
+                    source,
+                    0,
+                    [
+                        kCGImageSourceCreateThumbnailFromImageAlways: true,
+                        kCGImageSourceCreateThumbnailWithTransform: true,
+                        kCGImageSourceThumbnailMaxPixelSize: 2_560
+                    ] as CFDictionary
+                  ) else {
+                throw PlayerPreparationError.notPlayable
+            }
+            return decoded
+        }
+        return NSImage(cgImage: image, size: NSSize(width: image.width, height: image.height))
     }
 
     /// 等待 item 就绪（轮询读取缓存属性，不做阻塞 I/O），再异步跳转。
@@ -2493,7 +2671,7 @@ private enum AppLifecycleError: Error, LocalizedError {
         case .databaseUnavailable:
             "本地数据库尚未就绪，请稍后重试。"
         case .libraryRootUnavailable:
-            "该视频所属媒体库已被移除或停用。"
+            "该媒体所属媒体库已被移除或停用。"
         case let .missingBearerCredential(role):
             "\(role.displayName)已启用 Bearer 鉴权，请填写 API key。"
         case let .reauthorizationTargetMismatch(expected):

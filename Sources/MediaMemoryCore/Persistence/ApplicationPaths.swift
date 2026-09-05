@@ -37,6 +37,11 @@ public enum ApplicationPaths {
             .appending(path: "models.json", directoryHint: .notDirectory)
     }
 
+    public static func modelCredentialsURL() throws -> URL {
+        try baseDirectoryURL()
+            .appending(path: "model-credentials.json", directoryHint: .notDirectory)
+    }
+
     public static func instanceLockURL() throws -> URL {
         try baseDirectoryURL()
             .appending(path: "instance.lock", directoryHint: .notDirectory)

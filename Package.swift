@@ -9,7 +9,9 @@ let package = Package(
     ],
     products: [
         .executable(name: "MediaMemoryApp", targets: ["MediaMemoryApp"]),
-        .library(name: "MediaMemoryCore", targets: ["MediaMemoryCore"])
+        .library(name: "MediaMemoryCore", targets: ["MediaMemoryCore"]),
+        .library(name: "MediaMemoryMCPServer", targets: ["MediaMemoryMCPServer"]),
+        .executable(name: "media-memory-mcp", targets: ["MediaMemoryMCPTool"])
     ],
     targets: [
         .systemLibrary(name: "CSQLite"),
@@ -40,6 +42,18 @@ let package = Package(
         .testTarget(
             name: "MediaMemoryCoreTests",
             dependencies: ["MediaMemoryCore"]
+        ),
+        .target(
+            name: "MediaMemoryMCPServer",
+            dependencies: ["MediaMemoryCore"]
+        ),
+        .executableTarget(
+            name: "MediaMemoryMCPTool",
+            dependencies: ["MediaMemoryMCPServer"]
+        ),
+        .testTarget(
+            name: "MediaMemoryMCPServerTests",
+            dependencies: ["MediaMemoryMCPServer"]
         )
     ]
 )

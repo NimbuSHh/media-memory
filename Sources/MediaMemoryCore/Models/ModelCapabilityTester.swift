@@ -196,6 +196,7 @@ public enum ModelCapabilityTester {
         let result = try await HTTPModelClient().describeSegment(
             endpointURL: endpointURL,
             apiKey: credentials.description,
+            kind: .image,
             images: [TimedImageInput(timeMS: 0, url: imageURL)],
             evidenceText: "没有用户数据；这是应用生成的连通性测试图片。",
             modelID: configuration.description.modelID

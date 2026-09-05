@@ -406,21 +406,85 @@ public struct AssetProcessingSummary: Equatable, Sendable {
     }
 }
 
+/// 一个媒体库在处理队列中的实时状态。判定与调度器完全同源：只统计
+/// ready、未失效、未排除资产上的 pending/running 任务——挂在不在线媒体
+/// 上的积压任务调度器永远不会认领，不能让队列显示成"永远不前进"。
+public struct LibraryRootQueueState: Sendable, Equatable {
+    public let pendingJobCount: Int
+    /// 该库名下处理任务的最后一次状态变更时刻；库内从未有过任务时为 nil。
+    public let lastJobActivityAt: Date?
+
+    public init(pendingJobCount: Int, lastJobActivityAt: Date?) {
+        self.pendingJobCount = pendingJobCount
+        self.lastJobActivityAt = lastJobActivityAt
+    }
+
+    /// 已完成 = 队列里没有该库的任务。动态派生：手动刷新或新扫描会让
+    /// 已完成的库重新入队。
+    public var isComplete: Bool { pendingJobCount == 0 }
+}
+
+/// 处理队列的展示与分区规则，App 侧栏与 MCP library_stats 共用同一份，
+/// 保证"看到的顺序"永远等于调度器实际处理的顺序。
+public enum LibraryRootQueue {
+    /// 库是否已完成处理。口径与调度器同源：只看可调度资产上的
+    /// pending/running 任务。尚未完成首次扫描的库视为排队中，即使还没有
+    /// 任何任务。
+    public static func isProcessed(
+        _ root: LibraryRootRecord,
+        states: [String: LibraryRootQueueState]
+    ) -> Bool {
+        guard root.lastScanAt != nil else { return false }
+        return states[root.id]?.isComplete ?? true
+    }
+
+    /// 展示顺序即处理顺序：排队库按 rank 从前到后（与调度器同序）；已完成
+    /// 库按完成时刻（最后一个任务的落定时间）倒序，从未产生任务的库
+    /// （如空目录）排最后、按加入顺序。
+    public static func orderedRoots(
+        roots: [LibraryRootRecord],
+        states: [String: LibraryRootQueueState]
+    ) -> [LibraryRootRecord] {
+        roots.sorted { lhs, rhs in
+            let lhsDone = isProcessed(lhs, states: states)
+            let rhsDone = isProcessed(rhs, states: states)
+            if lhsDone != rhsDone { return !lhsDone }
+            if !lhsDone {
+                return (lhs.processingRank, lhs.path) < (rhs.processingRank, rhs.path)
+            }
+            switch (states[lhs.id]?.lastJobActivityAt, states[rhs.id]?.lastJobActivityAt) {
+            case let (lhsDate?, rhsDate?):
+                if lhsDate != rhsDate { return lhsDate > rhsDate }
+                return lhs.createdAt < rhs.createdAt
+            case (.some, .none):
+                return true
+            case (.none, .some):
+                return false
+            case (.none, .none):
+                return lhs.createdAt < rhs.createdAt
+            }
+        }
+    }
+}
+
 /// One WAL snapshot for the library screen. Roots, visible assets and their
 /// processing badges must describe the same committed database state.
 public struct MediaLibrarySnapshot: Sendable {
     public let roots: [LibraryRootRecord]
     public let assets: [MediaAssetRecord]
     public let processingSummaries: [String: AssetProcessingSummary]
+    public let queueStates: [String: LibraryRootQueueState]
 
     public init(
         roots: [LibraryRootRecord],
         assets: [MediaAssetRecord],
-        processingSummaries: [String: AssetProcessingSummary]
+        processingSummaries: [String: AssetProcessingSummary],
+        queueStates: [String: LibraryRootQueueState] = [:]
     ) {
         self.roots = roots
         self.assets = assets
         self.processingSummaries = processingSummaries
+        self.queueStates = queueStates
     }
 }
 
@@ -501,5 +565,19 @@ public struct CachedSegmentDescription: Equatable, Sendable {
         self.modelID = modelID
         self.createdAt = createdAt
         self.isEvidenceCurrent = isEvidenceCurrent
+    }
+}
+
+/// 只读概览计数（MCP library_stats 等外部检索入口使用），口径与检索一致：
+/// 资产只统计可见就绪资产，片段只统计活动代际。
+public struct MediaLibraryStatistics: Equatable, Sendable {
+    public let assetCount: Int
+    public let segmentCount: Int
+    public let embeddingCount: Int
+
+    public init(assetCount: Int, segmentCount: Int, embeddingCount: Int) {
+        self.assetCount = assetCount
+        self.segmentCount = segmentCount
+        self.embeddingCount = embeddingCount
     }
 }

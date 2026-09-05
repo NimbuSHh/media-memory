@@ -45,11 +45,39 @@ final class HTTPModelClientTests: XCTestCase {
         let description = try await client.describeSegment(
             endpointURL: URL(string: "https://models.example/chat")!,
             apiKey: "test-key",
+            kind: .image,
             images: [TimedImageInput(timeMS: 0, url: image)],
             evidenceText: "fixture",
             modelID: "vision"
         )
         XCTAssertEqual(description.summary, "blue test image")
+    }
+
+    /// oMLX 的 MTP 与 grammar 约束互斥：描述请求禁止携带 response_format，
+    /// 且必须显式关闭思考，否则思考 token 抵消投机解码收益。
+    func testDescriptionPayloadReliesOnPromptContractForJSON() async throws {
+        let image = FileManager.default.temporaryDirectory
+            .appending(path: "media-memory-payload-\(UUID().uuidString).png")
+        try Data([4, 5, 6, 7]).write(to: image)
+        defer { try? FileManager.default.removeItem(at: image) }
+
+        let client = HTTPModelClient(session: makeSession())
+        _ = try await client.describeSegment(
+            endpointURL: URL(string: "https://models.example/chat")!,
+            apiKey: "test-key",
+            kind: .video,
+            images: [TimedImageInput(timeMS: 0, url: image)],
+            evidenceText: "fixture",
+            modelID: "vision"
+        )
+
+        let payload = try XCTUnwrap(ModelURLProtocol.lastChatPayload)
+        XCTAssertNil(payload["response_format"])
+        let templateArguments = try XCTUnwrap(payload["chat_template_kwargs"] as? [String: Any])
+        XCTAssertEqual(templateArguments["enable_thinking"] as? Bool, false)
+        let messages = try XCTUnwrap(payload["messages"] as? [[String: Any]])
+        XCTAssertEqual(messages.count, 2)
+        XCTAssertEqual(payload["temperature"] as? Int, 0)
     }
 
     func testHTTPErrorPreservesStatusAndUsefulBody() async throws {
@@ -84,6 +112,8 @@ final class HTTPModelClientTests: XCTestCase {
 }
 
 private final class ModelURLProtocol: URLProtocol, @unchecked Sendable {
+    nonisolated(unsafe) static var lastChatPayload: [String: Any]?
+
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
 
@@ -103,6 +133,7 @@ private final class ModelURLProtocol: URLProtocol, @unchecked Sendable {
             body = #"{"dimension":3,"vector":[1,0,0],"norm":1}"#
         case "/chat":
             status = 200
+            Self.lastChatPayload = Self.decodeBody(request) ?? [:]
             body = #"{"choices":[{"message":{"content":"```json\n{\"summary\":\"blue test image\",\"visible_details\":[\"blue\"],\"uncertainty\":[]}\n```"}}]}"#
         default:
             status = 401
@@ -120,4 +151,25 @@ private final class ModelURLProtocol: URLProtocol, @unchecked Sendable {
     }
 
     override func stopLoading() {}
+
+    private static func decodeBody(_ request: URLRequest) -> [String: Any]? {
+        var data = request.httpBody
+        if data == nil, let stream = request.httpBodyStream {
+            stream.open()
+            defer { stream.close() }
+            var collected = Data()
+            let bufferSize = 4_096
+            var buffer = [UInt8](repeating: 0, count: bufferSize)
+            while stream.hasBytesAvailable {
+                let read = stream.read(&buffer, maxLength: bufferSize)
+                guard read > 0 else { break }
+                collected.append(buffer, count: read)
+            }
+            data = collected
+        }
+        guard let data, let payload = try? JSONSerialization.jsonObject(with: data) else {
+            return nil
+        }
+        return payload as? [String: Any]
+    }
 }

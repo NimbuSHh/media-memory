@@ -213,7 +213,7 @@ final class ModelConfigurationTests: XCTestCase {
         XCTAssertEqual(loaded.configuration.aligner.authentication, .bearer)
     }
 
-    func testAuthenticationRoundTripAndEmptyCredentialRoleLoadAvoidsKeychain() throws {
+    func testAuthenticationRoundTripAndEmptyCredentialRoleLoadAvoidsStorage() throws {
         let endpoint = ModelEndpoint(
             transport: .openAIChatCompletion,
             endpointURL: URL(string: "https://models.example/chat/completions"),
@@ -226,7 +226,14 @@ final class ModelConfigurationTests: XCTestCase {
         )
 
         XCTAssertEqual(decoded, endpoint)
-        XCTAssertEqual(try KeychainStore.loadModelCredentials(for: []), ModelCredentials())
+        let credentialsURL = FileManager.default.temporaryDirectory
+            .appending(path: "media-memory-credentials-\(UUID().uuidString).json")
+        XCTAssertEqual(
+            try ModelCredentialStore.loadModelCredentials(fileURL: credentialsURL, for: []),
+            ModelCredentials()
+        )
+        // 空 role 集合不触碰任何存储：文件不存在也不得被创建。
+        XCTAssertFalse(FileManager.default.fileExists(atPath: credentialsURL.path))
     }
 
     func testSchemaOnePreservesRemoteBearerAuthentication() throws {
@@ -254,51 +261,5 @@ final class ModelConfigurationTests: XCTestCase {
         XCTAssertEqual(configuration.asr.authentication, .bearer)
         XCTAssertEqual(configuration.description.authentication, .bearer)
         XCTAssertEqual(configuration.credentialRoles, [.asr, .description])
-    }
-
-    func testExplicitCredentialMigrationReplacesOnlyRequestedRoles() throws {
-        let credentials = ModelCredentials(
-            asr: "new-asr",
-            aligner: "new-aligner",
-            embedding: "new-embedding",
-            description: "new-description"
-        )
-        var replacements: [(ModelRole, String)] = []
-
-        try KeychainStore.replaceCredentialsForMigration(
-            credentials,
-            roles: [.asr, .description]
-        ) { role, value in
-            replacements.append((role, value))
-        }
-
-        XCTAssertEqual(replacements.map(\.0), [.asr, .description])
-        XCTAssertEqual(replacements.map(\.1), ["new-asr", "new-description"])
-        XCTAssertTrue(KeychainError.status(errSecAuthFailed).isAccessDenied)
-        XCTAssertFalse(KeychainError.status(errSecParam).isAccessDenied)
-    }
-
-    func testExplicitCredentialMigrationReportsPartialProgressAndCanBeRetried() throws {
-        enum ExpectedFailure: Error { case denied }
-        let credentials = ModelCredentials(asr: "asr", description: "description")
-
-        XCTAssertThrowsError(
-            try KeychainStore.replaceCredentialsForMigration(
-                credentials,
-                roles: [.asr, .description]
-            ) { role, _ in
-                if role == .description { throw ExpectedFailure.denied }
-            }
-        ) { error in
-            guard case let KeychainError.migrationPartiallyCompleted(
-                completedAccounts,
-                failedAccount,
-                _
-            ) = error else {
-                return XCTFail("unexpected error: \(error)")
-            }
-            XCTAssertEqual(completedAccounts, [ModelRole.asr.rawValue])
-            XCTAssertEqual(failedAccount, ModelRole.description.rawValue)
-        }
     }
 }

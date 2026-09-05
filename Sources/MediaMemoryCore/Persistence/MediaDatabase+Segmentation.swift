@@ -18,10 +18,40 @@ public enum SegmentationDatabaseError: Error, LocalizedError, Equatable, Sendabl
 }
 
 extension MediaDatabase {
+    /// 仅 reconcile 视频配方的兼容入口：映射为"只有视频一种配方"。
+    /// 图片资产存在的库必须走 `algorithmVersionByKind:` 全量入口。
     public func reconcileSegmentationJobs(
         algorithmVersion: String,
         now: Date = Date()
     ) throws -> IndexingProgress {
+        try reconcileSegmentationJobs(
+            algorithmVersionByKind: [.video: algorithmVersion],
+            now: now
+        )
+    }
+
+    /// 每种媒体类型按各自的算法身份 reconcile：视频与图片的算法版本独立
+    /// 演进，互不触发对方的重新分片。每个类型一个事务，互相独立提交。
+    public func reconcileSegmentationJobs(
+        algorithmVersionByKind: [MediaKind: String],
+        now: Date = Date()
+    ) throws -> IndexingProgress {
+        for kind in MediaKind.allCases {
+            guard let algorithmVersion = algorithmVersionByKind[kind] else { continue }
+            try reconcileSegmentationJobs(
+                forKind: kind,
+                algorithmVersion: algorithmVersion,
+                now: now
+            )
+        }
+        return try segmentationProgress()
+    }
+
+    private func reconcileSegmentationJobs(
+        forKind kind: MediaKind,
+        algorithmVersion: String,
+        now: Date
+    ) throws {
         try connection.inTransaction {
             let reset = try connection.prepare(
                 """
@@ -54,6 +84,7 @@ extension MediaDatabase {
                       WHERE a.status = 'ready'
                         AND a.invalidated_at IS NULL
                         AND a.is_excluded = 0
+                        AND a.media_kind = ?
                         AND (
                             a.candidate_duration_ms IS NOT NULL
                             OR NOT EXISTS (
@@ -79,7 +110,8 @@ extension MediaDatabase {
             )
             try reset.bind(.real(now.timeIntervalSince1970), at: 2)
             try reset.bind(.text(algorithmVersion), at: 3)
-            try reset.bind(.text(algorithmVersion), at: 4)
+            try reset.bind(.text(kind.rawValue), at: 4)
+            try reset.bind(.text(algorithmVersion), at: 5)
             _ = try reset.step()
 
             let enqueue = try connection.prepare(
@@ -99,6 +131,7 @@ extension MediaDatabase {
                 WHERE a.status = 'ready'
                   AND a.invalidated_at IS NULL
                   AND a.is_excluded = 0
+                  AND a.media_kind = ?
                   AND j.id IS NULL
                   AND (
                       a.candidate_duration_ms IS NOT NULL
@@ -124,7 +157,8 @@ extension MediaDatabase {
             )
             try enqueue.bind(.real(now.timeIntervalSince1970), at: 2)
             try enqueue.bind(.real(now.timeIntervalSince1970), at: 3)
-            try enqueue.bind(.text(algorithmVersion), at: 4)
+            try enqueue.bind(.text(kind.rawValue), at: 4)
+            try enqueue.bind(.text(algorithmVersion), at: 5)
             _ = try enqueue.step()
 
             // Once semantic segmentation owns an asset, pending work for its
@@ -181,7 +215,6 @@ extension MediaDatabase {
             )
             _ = try removeEmptyFallback.step()
         }
-        return try segmentationProgress()
     }
 
     public func claimNextSegmentationJob(
@@ -199,7 +232,8 @@ extension MediaDatabase {
                        a.file_size, a.modification_time, a.duration_ms,
                        a.video_track_count, a.audio_track_count, a.is_playable,
                        a.fingerprint, a.status, a.error_message,
-                       a.first_seen_at, a.last_seen_at, a.candidate_duration_ms
+                       a.first_seen_at, a.last_seen_at, a.candidate_duration_ms,
+                       a.media_kind, a.pixel_width, a.pixel_height
                 FROM job j
                 JOIN media_asset a ON a.id = j.asset_id
                 WHERE j.kind = 'segment_asset'
@@ -942,7 +976,10 @@ extension MediaDatabase {
             status: status,
             errorMessage: statement.text(at: offset + 12),
             firstSeenAt: Date(timeIntervalSince1970: statement.real(at: offset + 13)),
-            lastSeenAt: Date(timeIntervalSince1970: statement.real(at: offset + 14))
+            lastSeenAt: Date(timeIntervalSince1970: statement.real(at: offset + 14)),
+            mediaKind: MediaKind(rawValue: statement.text(at: offset + 16) ?? "") ?? .video,
+            pixelWidth: Int(statement.integer(at: offset + 17)),
+            pixelHeight: Int(statement.integer(at: offset + 18))
         )
     }
 }

@@ -179,6 +179,7 @@ public actor ModelRuntime {
     }
 
     public func describe(
+        kind: MediaKind = .video,
         images: [TimedImageInput],
         evidenceText: String
     ) async throws -> SegmentDescription {
@@ -191,6 +192,7 @@ public actor ModelRuntime {
             let value = try await client.describeSegment(
                 endpointURL: endpointURL,
                 apiKey: credentials.description,
+                kind: kind,
                 images: images,
                 evidenceText: evidenceText,
                 modelID: configuration.description.modelID

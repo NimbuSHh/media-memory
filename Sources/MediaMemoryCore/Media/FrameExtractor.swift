@@ -30,6 +30,37 @@ public enum FrameExtractionError: Error, LocalizedError, Sendable {
 public enum FrameExtractor {
     public static let persistentThumbnailMaximumBytes = 4 * 1_024
 
+    /// 图片资产与视频抽样帧共用同一表示：解码降采样到模型输入上限，产出
+    /// 单个名义时刻（timeMS 0）的样本。下游 OCR、向量与持久化完全复用。
+    public static func extractImageAsset(
+        assetURL: URL,
+        destinationDirectory: URL,
+        maximumPixelSize: CGFloat = 1_280
+    ) async throws -> FrameSample {
+        try FileManager.default.createDirectory(
+            at: destinationDirectory,
+            withIntermediateDirectories: true
+        )
+        return try await Task.detached(priority: .utility) {
+            guard let source = CGImageSourceCreateWithURL(assetURL as CFURL, nil) else {
+                throw FrameExtractionError.cannotReadImage(assetURL.path)
+            }
+            let options: [CFString: Any] = [
+                kCGImageSourceCreateThumbnailFromImageAlways: true,
+                kCGImageSourceCreateThumbnailWithTransform: true,
+                kCGImageSourceThumbnailMaxPixelSize: maximumPixelSize
+            ]
+            guard let image = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else {
+                throw FrameExtractionError.cannotReadImage(assetURL.path)
+            }
+            try Task.checkCancellation()
+            let hash = perceptualHash(image)
+            let imageURL = destinationDirectory.appending(path: "image-000000000000.jpg")
+            try writeJPEG(image, to: imageURL)
+            return FrameSample(timeMS: 0, imageURL: imageURL, perceptualHash: hash)
+        }.value
+    }
+
     public static func extract(
         assetURL: URL,
         startMS: Int64,

@@ -39,7 +39,7 @@ public actor SegmentIndexer {
     private let runtime: LocalModelRuntime
     private let sourceCache: LocalSourceCache
     private let workRoot: URL
-    private let inputVersion: String
+    private let inputVersionByKind: [MediaKind: String]
 
     public init(
         database: MediaDatabase,
@@ -53,21 +53,48 @@ public actor SegmentIndexer {
         self.runtime = runtime
         self.sourceCache = sourceCache
         self.workRoot = workRoot.standardizedFileURL
-        inputVersion = Self.inputVersion(for: configuration)
+        inputVersionByKind = [
+            .video: Self.inputVersion(for: configuration, kind: .video),
+            .image: Self.inputVersion(for: configuration, kind: .image)
+        ]
     }
 
+    /// 每种媒体类型独立的建库配方身份。视频配方字节保持不变：改变它会
+    /// 触发全库重新嵌入。图片配方不含 ASR/对齐模型——它们的变更不应
+    /// 使图片向量失效。
+    public static func inputVersion(
+        for configuration: ModelConfiguration,
+        kind: MediaKind
+    ) -> String {
+        switch kind {
+        case .video:
+            let source = [
+                "segment-v1",
+                frameSelectionVersion,
+                "vision-ocr-v1",
+                configuration.asr.derivationID,
+                configuration.aligner.derivationID,
+                configuration.embedding.derivationID
+            ].joined(separator: "|")
+            return SHA256.hash(data: Data(source.utf8))
+                .map { String(format: "%02x", $0) }
+                .joined()
+        case .image:
+            let source = [
+                "image-v1",
+                frameSelectionVersion,
+                "vision-ocr-v1",
+                configuration.embedding.derivationID
+            ].joined(separator: "|")
+            return SHA256.hash(data: Data(source.utf8))
+                .map { String(format: "%02x", $0) }
+                .joined()
+        }
+    }
+
+    /// 视频配方的兼容入口：既有调用与测试的稳定身份。
     public static func inputVersion(for configuration: ModelConfiguration) -> String {
-        let source = [
-            "segment-v1",
-            frameSelectionVersion,
-            "vision-ocr-v1",
-            configuration.asr.derivationID,
-            configuration.aligner.derivationID,
-            configuration.embedding.derivationID
-        ].joined(separator: "|")
-        return SHA256.hash(data: Data(source.utf8))
-            .map { String(format: "%02x", $0) }
-            .joined()
+        inputVersion(for: configuration, kind: .video)
     }
 
     /// Schema-1 persisted the three bare model IDs in the evidence fingerprint.
@@ -92,7 +119,7 @@ public actor SegmentIndexer {
         if activated { await cleanupPrunedFrames() }
         try await database.reconcileIndexJobs(
             embeddingModelID: configuration.embedding.derivationID,
-            inputVersion: inputVersion
+            inputVersionByKind: inputVersionByKind
         )
         return try await database.indexingProgress()
     }
@@ -309,7 +336,6 @@ public actor SegmentIndexer {
         try Task.checkCancellation()
         let sourceURL = try await sourceCache.localURL(for: target.asset)
         try await sourceCache.validateLocalURL(sourceURL, for: target.asset)
-        try await stage("audio", target: target, onEvent: onEvent)
 
         let runDirectory = workRoot
             .appending(path: "Runs", directoryHint: .isDirectory)
@@ -319,6 +345,7 @@ public actor SegmentIndexer {
 
         var audioURL: URL?
         if target.asset.audioTrackCount > 0 {
+            try await stage("audio", target: target, onEvent: onEvent)
             let destination = runDirectory.appending(path: "audio.wav")
             _ = try await extractAudio(target: target, destination: destination)
             audioURL = destination
@@ -407,12 +434,21 @@ public actor SegmentIndexer {
     ) async throws -> [FrameSample] {
         try await AsyncTimeout.run(for: .seconds(120), operationName: "提取片段画面") {
             try await self.sourceCache.withLocalURL(for: target.asset) { sourceURL in
-                try await FrameExtractor.extract(
-                    assetURL: sourceURL,
-                    startMS: target.segment.startMS,
-                    endMS: target.segment.endMS,
-                    destinationDirectory: destination
-                )
+                switch target.asset.mediaKind {
+                case .image:
+                    let sample = try await FrameExtractor.extractImageAsset(
+                        assetURL: sourceURL,
+                        destinationDirectory: destination
+                    )
+                    return [sample]
+                case .video:
+                    return try await FrameExtractor.extract(
+                        assetURL: sourceURL,
+                        startMS: target.segment.startMS,
+                        endMS: target.segment.endMS,
+                        destinationDirectory: destination
+                    )
+                }
             }
         }
     }
@@ -509,10 +545,17 @@ public actor SegmentIndexer {
         try Task.checkCancellation()
         try await stage("embedding", target: target, onEvent: onEvent)
         let evidenceText = embeddingText(transcripts: transcripts, ocr: ocr)
+        let instruction: String
+        switch target.asset.mediaKind {
+        case .image:
+            instruction = "Represent this image for semantic retrieval."
+        case .video:
+            instruction = "Represent this ordered video segment for semantic retrieval."
+        }
         let embedding = try await runtime.embed(
             text: evidenceText,
             imageURLs: representatives.map(\.imageURL),
-            instruction: "Represent this ordered video segment for semantic retrieval."
+            instruction: instruction
         )
 
         try Task.checkCancellation()
@@ -539,7 +582,7 @@ public actor SegmentIndexer {
                 claim: target.job.claimToken,
                 segmentID: target.segment.id,
                 output: output,
-                inputVersion: inputVersion
+                inputVersion: inputVersionByKind[target.asset.mediaKind]!
             )
         } catch {
             removePersistedFrames(storedFrames)

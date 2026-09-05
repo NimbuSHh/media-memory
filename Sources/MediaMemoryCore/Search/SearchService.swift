@@ -8,7 +8,8 @@ public actor SearchService {
     private let database: MediaDatabase
     private let configuration: ModelConfiguration
     private let runtime: LocalModelRuntime?
-    private let inputVersion: String
+    /// 两种媒体类型的当前建库配方；语义索引同时装载两者。
+    private let inputVersions: [String]
     private var cachedRevision: String?
     private var vectorIndex = SemanticVectorIndex(records: [])
 
@@ -20,7 +21,10 @@ public actor SearchService {
         self.database = database
         self.configuration = configuration
         self.runtime = runtime
-        inputVersion = SegmentIndexer.inputVersion(for: configuration)
+        inputVersions = [
+            SegmentIndexer.inputVersion(for: configuration, kind: .video),
+            SegmentIndexer.inputVersion(for: configuration, kind: .image)
+        ]
     }
 
     /// Model-independent first phase. Callers can publish these results
@@ -254,12 +258,12 @@ public actor SearchService {
         try Task.checkCancellation()
         let revision = try await database.embeddingIndexRevision(
             modelID: configuration.embedding.derivationID,
-            inputVersion: inputVersion
+            inputVersions: inputVersions
         )
         if revision != cachedRevision {
             let stored = try await database.storedEmbeddings(
                 modelID: configuration.embedding.derivationID,
-                inputVersion: inputVersion
+                inputVersions: inputVersions
             )
             vectorIndex = SemanticVectorIndex(records: stored)
             cachedRevision = revision

@@ -166,20 +166,51 @@ public actor HTTPModelClient {
     public func describeSegment(
         endpointURL: URL,
         apiKey: String,
+        kind: MediaKind,
         images: [TimedImageInput],
         evidenceText: String,
         modelID: String
     ) async throws -> SegmentDescription {
-        var content: [[String: Any]] = [[
-            "type": "text",
-            "text": """
+        let systemPrompt: String
+        let leadText: String
+        let imageLabel: (Int64) -> String
+        switch kind {
+        case .video:
+            systemPrompt = """
+            你是视频片段的视觉描述器，只能依据给定关键帧与 ASR/OCR 证据
+            描述可观察事实。不要猜测身份、关系、地点、意图、情绪或声音。
+            """
+            leadText = """
             以下图片按源视频时间顺序排列，是你唯一的视觉输入。
             你没有音频输入：禁止描述、推测或虚构任何声音、语音或音乐内容。
             ASR/OCR 证据如下（语音与画面文字以证据为准，描述中不要罗列文字清单）：
             \(evidenceText)
-            只输出符合约定 schema 的 JSON。summary 组织片段整体叙述；
-            visible_details 逐条描述可观察事实；无法确认的内容写入 uncertainty。
+            只输出一个 JSON 对象，禁止输出 JSON 以外的任何文字或代码块标记。
+            形状：{"summary": string, "visible_details": string[], "uncertainty": string[]}。
+            summary 组织片段整体叙述；visible_details 逐条描述可观察事实；
+            无法确认的内容写入 uncertainty。
             """
+            imageLabel = { String(format: "源视频时间 %.3f 秒：", Double($0) / 1_000) }
+        case .image:
+            systemPrompt = """
+            你是图片的视觉描述器，只能依据给定图片与 OCR 证据描述可观察
+            事实。不要猜测身份、关系、地点、意图、情绪或声音。
+            """
+            leadText = """
+            以下图片是你唯一的视觉输入。
+            你没有音频输入：禁止描述、推测或虚构任何声音、语音或音乐内容。
+            OCR 证据如下（画面文字以证据为准，描述中不要罗列文字清单）：
+            \(evidenceText)
+            只输出一个 JSON 对象，禁止输出 JSON 以外的任何文字或代码块标记。
+            形状：{"summary": string, "visible_details": string[], "uncertainty": string[]}。
+            summary 组织图片整体叙述；visible_details 逐条描述可观察事实；
+            无法确认的内容写入 uncertainty。
+            """
+            imageLabel = { _ in "图片：" }
+        }
+        var content: [[String: Any]] = [[
+            "type": "text",
+            "text": leadText
         ]]
         for image in images {
             try Task.checkCancellation()
@@ -187,7 +218,7 @@ public actor HTTPModelClient {
             let mimeType = image.url.pathExtension.lowercased() == "png" ? "image/png" : "image/jpeg"
             content.append([
                 "type": "text",
-                "text": String(format: "源视频时间 %.3f 秒：", Double(image.timeMS) / 1_000)
+                "text": imageLabel(image.timeMS)
             ])
             content.append([
                 "type": "image_url",
@@ -195,39 +226,22 @@ public actor HTTPModelClient {
             ])
         }
 
-        let stringArray: [String: Any] = ["type": "array", "items": ["type": "string"]]
-        let schema: [String: Any] = [
-            "type": "object",
-            "properties": [
-                "summary": ["type": "string"],
-                "visible_details": stringArray,
-                "uncertainty": stringArray
-            ],
-            "required": ["summary", "visible_details", "uncertainty"],
-            "additionalProperties": false
-        ]
+        // oMLX 的原生 MTP 投机解码与 grammar 约束互斥（约束解码走
+        // GenerationBatch._step 路径，请求会被判 ineligible），因此 JSON
+        // 形状改由提示词约定、解析端容错兜底。enable_thinking 关闭思考：
+        // 思考 token 会让输出量翻倍，抵消投机解码的收益。
         let payload: [String: Any] = [
             "model": modelID,
             "messages": [
                 [
                     "role": "system",
-                    "content": """
-                    你是视频片段的视觉描述器，只能依据给定关键帧与 ASR/OCR 证据
-                    描述可观察事实。不要猜测身份、关系、地点、意图、情绪或声音。
-                    """
+                    "content": systemPrompt
                 ],
                 ["role": "user", "content": content]
             ],
             "temperature": 0,
             "max_tokens": 800,
-            "response_format": [
-                "type": "json_schema",
-                "json_schema": [
-                    "name": "segment_evidence_description",
-                    "strict": true,
-                    "schema": schema
-                ]
-            ]
+            "chat_template_kwargs": ["enable_thinking": false]
         ]
         var request = try request(url: endpointURL, apiKey: apiKey)
         request.timeoutInterval = 600
@@ -380,6 +394,7 @@ public actor OMLXClient {
     }
 
     public func describeSegment(
+        kind: MediaKind,
         images: [TimedImageInput],
         evidenceText: String,
         modelID: String
@@ -387,6 +402,7 @@ public actor OMLXClient {
         try await client.describeSegment(
             endpointURL: baseURL.appending(path: "chat/completions"),
             apiKey: apiKey,
+            kind: kind,
             images: images,
             evidenceText: evidenceText,
             modelID: modelID

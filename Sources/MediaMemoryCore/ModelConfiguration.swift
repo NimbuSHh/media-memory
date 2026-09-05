@@ -90,7 +90,7 @@ public struct ModelEndpoint: Codable, Equatable, Sendable {
         } else {
             // Schema 1/2 had no explicit authentication mode. Preserve likely
             // remote Bearer setups while ensuring local no-auth services never
-            // cause a Keychain read merely because the app launched.
+            // cause a credential read merely because the app launched.
             authentication = endpointURL?.isLoopbackHost == true ? .none : .bearer
         }
     }

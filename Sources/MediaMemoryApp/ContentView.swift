@@ -14,9 +14,7 @@ struct ContentView: View {
     @State private var pendingRootRemoval: LibraryRootRecord?
     @State private var pendingAssetRemoval: MediaAssetRecord?
     @State private var selectedSegmentID: String?
-    @State private var showFailureList = false
-    @State private var showBackgroundWarnings = false
-    @StateObject private var playbackKeyMonitor = PlaybackKeyMonitor()
+    @StateObject private var windowInputMonitor = WindowInputMonitor()
     @FocusState private var focusedField: FocusedField?
 
     var body: some View {
@@ -32,22 +30,33 @@ struct ContentView: View {
         .toolbar {
             ToolbarItemGroup {
                 Button(action: chooseMedia) {
-                    Label("添加目录或视频", systemImage: "folder.badge.plus")
+                    Label("添加目录或媒体", systemImage: "folder.badge.plus")
                 }
+                .help("把媒体目录或单个媒体文件加入媒体库")
                 .disabled(model.startupPhase != .ready || model.isLibraryBusy)
                 if model.isScanning {
                     Button(action: model.cancelScan) {
                         Label("停止扫描", systemImage: "stop.fill")
                     }
+                    .help("停止正在进行的库扫描，已处理的文件会保留")
                 }
+                Button(action: { model.isAgentIntegrationPresented = true }) {
+                    Label("Agent 接入", systemImage: "terminal")
+                }
+                .help("让 Claude Code、Codex 等 AI agent 通过 MCP 语义检索本地媒体库")
+                .disabled(model.startupPhase != .ready)
                 Button(action: model.openSettings) {
                     Label("模型设置", systemImage: "gearshape")
                 }
+                .help("配置语音识别、向量、画面描述等模型服务")
                 .disabled(model.startupPhase != .ready)
             }
         }
         .sheet(isPresented: $model.isSettingsPresented) {
             ModelSettingsView(model: model)
+        }
+        .sheet(isPresented: $model.isAgentIntegrationPresented) {
+            AgentIntegrationView()
         }
         .alert(
             "Media Memory",
@@ -77,11 +86,11 @@ struct ContentView: View {
             Button("取消", role: .cancel) { pendingRootRemoval = nil }
         } message: { root in
             Text(root.kind == .directory
-                ? "将删除该目录下全部视频的记录、识别结果、向量与描述缓存；源文件不会被改动，重新添加可完整重建。"
-                : "将删除该视频的记录、识别结果、向量与描述缓存；源文件不会被改动，重新添加可完整重建。")
+                ? "将删除该目录下全部媒体的记录、识别结果、向量与描述缓存；源文件不会被改动，重新添加可完整重建。"
+                : "将删除该媒体的记录、识别结果、向量与描述缓存；源文件不会被改动，重新添加可完整重建。")
         }
         .confirmationDialog(
-            "从媒体库移除该视频",
+            "从媒体库移除该媒体",
             isPresented: Binding(
                 get: { pendingAssetRemoval != nil },
                 set: { if !$0 { pendingAssetRemoval = nil } }
@@ -94,153 +103,41 @@ struct ContentView: View {
             }
             Button("取消", role: .cancel) { pendingAssetRemoval = nil }
         } message: { _ in
-            Text("将删除该视频的识别结果、向量与描述缓存，并在后续扫描中保持排除；源文件不会被改动。")
+            Text("将删除该媒体的识别结果、向量与描述缓存，并在后续扫描中保持排除；源文件不会被改动。")
         }
         .onAppear {
-            playbackKeyMonitor.start(model: model)
+            windowInputMonitor.start(model: model)
         }
         .onDisappear {
-            playbackKeyMonitor.stop()
+            windowInputMonitor.stop()
         }
     }
 
     private var sidebar: some View {
         List {
-            Section("媒体库") {
+            Section("处理队列") {
                 // 全部视频的统计只列数字；整体处理进度由左下角队列面板展示，
                 // 避免同一列里出现两条相同的总进度条。
                 VStack(alignment: .leading, spacing: 3) {
-                    Label("全部视频", systemImage: "rectangle.stack")
+                    Label("全部媒体", systemImage: "rectangle.stack")
                     rootStatsCaption(model.libraryStatistics, isSelected: false)
                 }
                 .contentShape(Rectangle())
                 .onTapGesture { model.selectedRootID = nil }
-                ForEach(model.roots) { root in
-                    rootRow(root)
+                ForEach(Array(model.queuedRoots.enumerated()), id: \.element.id) { index, root in
+                    rootRow(root, queuePosition: index + 1)
+                }
+            }
+            if !model.completedRoots.isEmpty {
+                Section("已完成") {
+                    ForEach(model.completedRoots) { root in
+                        rootRow(root, queuePosition: nil)
+                    }
                 }
             }
         }
         .safeAreaInset(edge: .bottom) {
-            VStack(alignment: .leading, spacing: 8) {
-                if model.videoQueue.total > 0 {
-                    VStack(alignment: .leading, spacing: 4) {
-                        ProgressView(value: model.videoQueue.completedFraction)
-                        HStack(spacing: 6) {
-                            Text("视频 \(model.videoQueue.completed)/\(model.videoQueue.total)")
-                            if model.videoQueue.inProgress > 0 {
-                                Text("· 处理中 \(model.videoQueue.inProgress)")
-                                    .foregroundStyle(.blue)
-                            }
-                            if model.videoQueue.waiting > 0 {
-                                Text("· 待处理 \(model.videoQueue.waiting)")
-                                    .foregroundStyle(.secondary)
-                            }
-                            if model.videoQueue.failed > 0 {
-                                Text("· 失败 \(model.videoQueue.failed)")
-                                    .foregroundStyle(.orange)
-                            }
-                            if model.videoQueue.notStarted > 0 {
-                                Text("· 未开始 \(model.videoQueue.notStarted)")
-                                    .foregroundStyle(.secondary)
-                            }
-                            Spacer()
-                        }
-                        .font(.caption)
-                    }
-                }
-                if model.indexingProgress.total > 0 {
-                    laneProgress(
-                        title: "建库",
-                        progress: model.indexingProgress,
-                        systemImage: "waveform"
-                    )
-                }
-                if model.segmentationProgress.total > 0 {
-                    laneProgress(
-                        title: "内容分片",
-                        progress: model.segmentationProgress,
-                        systemImage: "timeline.selection"
-                    )
-                }
-                if model.describeProgress.total > 0 {
-                    laneProgress(
-                        title: "描述",
-                        progress: model.describeProgress,
-                        systemImage: "sparkles"
-                    )
-                }
-                HStack(spacing: 12) {
-                    if model.isEvidenceIndexing {
-                        Button("暂停建库", action: model.pauseEvidenceProcessing)
-                    } else if model.segmentationProgress.pending > 0
-                                || model.indexingProgress.pending > 0 {
-                        Button("继续建库", action: model.startEvidenceProcessing)
-                    }
-                    if model.isDescriptionIndexing {
-                        Button("暂停描述", action: model.pauseDescriptionProcessing)
-                    } else if model.describeProgress.pending > 0 {
-                        Button("继续描述", action: model.startDescriptionProcessing)
-                    }
-                    if !model.failureSummaries.isEmpty {
-                        Button {
-                            showFailureList = true
-                        } label: {
-                            Label("失败 \(model.failureSummaries.count)", systemImage: "exclamationmark.triangle")
-                        }
-                        .foregroundStyle(.orange)
-                        .popover(isPresented: $showFailureList) {
-                            failureListPopover
-                        }
-                    }
-                    if !model.backgroundWarnings.isEmpty {
-                        Button {
-                            showBackgroundWarnings = true
-                        } label: {
-                            Label(
-                                "警告 \(model.backgroundWarnings.count)",
-                                systemImage: "exclamationmark.triangle"
-                            )
-                        }
-                        .foregroundStyle(.orange)
-                        .popover(isPresented: $showBackgroundWarnings) {
-                            backgroundWarningPopover
-                        }
-                    }
-                }
-                .controlSize(.small)
-                if model.staleDescriptionCount > 0 {
-                    HStack(spacing: 8) {
-                        Text("\(model.staleDescriptionCount) 条描述由旧版提示词/模型生成")
-                            .font(.caption)
-                            .foregroundStyle(.orange)
-                        Spacer()
-                        Button("重新生成旧版描述", action: model.regenerateStaleDescriptions)
-                            .controlSize(.small)
-                    }
-                }
-                VStack(alignment: .leading, spacing: 4) {
-                    statusLine(
-                        model.statusMessage,
-                        active: model.startupPhase == .loadingLocalData
-                            || model.isLibraryBusy || model.isSavingSettings
-                    )
-                    if model.isScanning || model.scanStatusMessage != "扫描空闲" {
-                        statusLine(model.scanStatusMessage, active: model.isScanning)
-                    }
-                    if model.isEvidenceIndexing || model.segmentationProgress.total > 0
-                        || model.indexingProgress.total > 0 {
-                        statusLine(model.evidenceStatusMessage, active: model.isEvidenceIndexing)
-                    }
-                    if model.isDescriptionIndexing || model.describeProgress.total > 0 {
-                        statusLine(model.descriptionStatusMessage, active: model.isDescriptionIndexing)
-                    }
-                    if model.isSearching || !model.searchStatusMessage.isEmpty {
-                        statusLine(model.searchStatusMessage, active: model.isSearching)
-                    }
-                }
-            }
-            .padding(12)
-            .background(.bar)
+            LibraryStatusPanel(model: model)
         }
         .navigationTitle("Media Memory")
         .navigationSplitViewColumnWidth(min: 200, ideal: 230, max: 280)
@@ -267,16 +164,27 @@ struct ContentView: View {
         return .white.opacity(onAccentOpacity)
     }
 
-    /// 侧栏路径行：名称、统计（视频数/大小/时长）、整体处理进度与上次扫描时间。
-    private func rootRow(_ root: LibraryRootRecord) -> some View {
+    /// 侧栏路径行：名称（排队中的库带队列位次）、统计（视频数/大小/时长）、
+    /// 整体处理进度与上次扫描时间。
+    private func rootRow(_ root: LibraryRootRecord, queuePosition: Int?) -> some View {
         let stats = model.rootStatistics[root.id]
         let isSelected = model.selectedRootID == root.id
         return VStack(alignment: .leading, spacing: 3) {
-            Label(
-                root.name,
-                systemImage: root.kind == .directory
-                    ? "folder" : "doc.movie"
-            )
+            Label {
+                HStack(spacing: 5) {
+                    Text(root.name)
+                        .lineLimit(1)
+                    if let queuePosition {
+                        Text("#\(queuePosition)")
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(
+                                sidebarTextColor(selected: isSelected, onAccentOpacity: 0.6)
+                            )
+                    }
+                }
+            } icon: {
+                Image(systemName: root.kind == .directory ? "folder" : "doc.movie")
+            }
             .foregroundStyle(titleColor(isSelected: isSelected))
             rootStatsCaption(stats, isSelected: isSelected)
             rootProcessingLine(stats?.queue, isSelected: isSelected)
@@ -304,6 +212,12 @@ struct ContentView: View {
             }
         )
         .contextMenu {
+            if let queuePosition {
+                Button("优先处理") {
+                    model.prioritizeRoot(root)
+                }
+                .disabled(queuePosition == 1)
+            }
             Button("重新扫描\(root.kind == .directory ? "此目录" : "此文件")") {
                 model.rescanRoot(root)
             }
@@ -317,29 +231,30 @@ struct ContentView: View {
         }
     }
 
-    /// 统计行：视频数 · 总大小 · 总时长（时长未知时省略）。
+    /// 统计行：媒体数（视频/图片）· 总大小 · 总时长（时长未知时省略）。
     @ViewBuilder
     private func rootStatsCaption(
         _ stats: RootLibraryStatistics?,
         isSelected: Bool
     ) -> some View {
-        if let stats, stats.videoCount > 0 {
+        if let stats, stats.videoCount + stats.imageCount > 0 {
             Text(rootStatsText(stats))
                 .font(.caption.monospacedDigit())
                 .foregroundStyle(sidebarTextColor(selected: isSelected))
                 .lineLimit(1)
         } else {
-            Text("尚无视频")
+            Text("尚无媒体")
                 .font(.caption)
                 .foregroundStyle(sidebarTextColor(selected: isSelected))
         }
     }
 
     private func rootStatsText(_ stats: RootLibraryStatistics) -> String {
-        var parts: [String] = [
-            "\(stats.videoCount) 个视频",
-            ByteCountFormatter.string(fromByteCount: stats.totalFileSize, countStyle: .file)
-        ]
+        var parts: [String] = []
+        if stats.videoCount > 0 { parts.append("\(stats.videoCount) 个视频") }
+        if stats.imageCount > 0 { parts.append("\(stats.imageCount) 张图片") }
+        if parts.isEmpty { parts.append("0 个媒体") }
+        parts.append(ByteCountFormatter.string(fromByteCount: stats.totalFileSize, countStyle: .file))
         if stats.totalDurationMS > 0 {
             parts.append(formatDuration(stats.totalDurationMS))
         }
@@ -392,141 +307,12 @@ struct ContentView: View {
         }
     }
 
-    private func statusLine(_ text: String, active: Bool) -> some View {
-        HStack(spacing: 8) {
-            if active {
-                ProgressView().controlSize(.small)
-            }
-            Text(text)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .lineLimit(2)
-            Spacer()
-        }
-    }
-
-    /// 失败任务列表：每条带资产名、片段、类型与具体原因，可复制。
-    private var failureListPopover: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            HStack {
-                Text("失败任务（\(model.failureSummaries.count)）")
-                    .font(.headline)
-                Spacer()
-                if model.failureSummaries.contains(where: {
-                    $0.kind == JobKind.segmentAsset.rawValue
-                        || $0.kind == JobKind.indexSegment.rawValue
-                }) {
-                    Button("重试建库") {
-                        showFailureList = false
-                        model.retryFailedEvidenceJobs()
-                    }
-                }
-                if model.failureSummaries.contains(where: { $0.kind == JobKind.describeSegment.rawValue }) {
-                    Button("重试描述") {
-                        showFailureList = false
-                        model.retryFailedDescriptionJobs()
-                    }
-                }
-            }
-            .padding(12)
-            Divider()
-            ScrollView {
-                VStack(alignment: .leading, spacing: 10) {
-                    ForEach(model.failureSummaries) { failure in
-                        VStack(alignment: .leading, spacing: 3) {
-                            HStack(spacing: 6) {
-                                Text(failure.assetName)
-                                    .font(.callout.weight(.medium))
-                                    .lineLimit(1)
-                                if let ordinal = failure.segmentOrdinal {
-                                    Text("片段 \(ordinal + 1)")
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                }
-                                Text(failure.kindName)
-                                    .font(.caption2)
-                                    .padding(.horizontal, 5)
-                                    .padding(.vertical, 1)
-                                    .background(.orange.opacity(0.15), in: Capsule())
-                                Spacer()
-                            }
-                            Text(failure.message)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                                .textSelection(.enabled)
-                                .lineLimit(4)
-                        }
-                        .padding(.horizontal, 12)
-                    }
-                }
-                .padding(.vertical, 10)
-            }
-            .frame(width: 460, height: 320)
-        }
-    }
-
-    private var backgroundWarningPopover: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            Text("后台状态与权限警告")
-                .font(.headline)
-                .padding(12)
-            Divider()
-            ScrollView {
-                VStack(alignment: .leading, spacing: 12) {
-                    ForEach(model.backgroundWarnings) { warning in
-                        VStack(alignment: .leading, spacing: 5) {
-                            HStack {
-                                Text(warning.title).font(.callout.weight(.medium))
-                                Spacer()
-                                if warning.id.hasPrefix("source.") {
-                                    Button("重试读取源") {
-                                        model.retrySourceCircuits()
-                                    }
-                                    .buttonStyle(.borderless)
-                                }
-                                Button("清除") {
-                                    model.dismissBackgroundWarning(warning)
-                                }
-                                .buttonStyle(.borderless)
-                            }
-                            Text(warning.detail)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                                .textSelection(.enabled)
-                        }
-                    }
-                }
-                .padding(12)
-            }
-            .frame(width: 460, height: 280)
-        }
-    }
-
-    private func laneProgress(
-        title: String,
-        progress: IndexingProgress,
-        systemImage: String
-    ) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            ProgressView(value: progress.fractionCompleted)
-            HStack {
-                Label("\(title) \(progress.succeeded)/\(progress.total)", systemImage: systemImage)
-                if progress.failed > 0 {
-                    Text("· 失败 \(progress.failed)")
-                        .foregroundStyle(.orange)
-                }
-                Spacer()
-            }
-            .font(.caption)
-        }
-    }
-
     private var searchAndAssets: some View {
         VStack(spacing: 0) {
             HStack(spacing: 8) {
                 Image(systemName: "magnifyingglass")
                     .foregroundStyle(.secondary)
-                TextField("用一句话找回视频片段", text: $model.searchQuery)
+                TextField("用一句话找回视频片段或图片", text: $model.searchQuery)
                     .textFieldStyle(.plain)
                     .focused($focusedField, equals: .search)
                     .onSubmit(submitSearch)
@@ -550,27 +336,195 @@ struct ContentView: View {
             if model.hasSearch {
                 searchResults
             } else {
-                assetList
+                VStack(spacing: 0) {
+                    filterBar
+                    Divider()
+                    assetList
+                }
             }
         }
-        .navigationTitle(model.hasSearch ? "搜索结果" : "视频（\(model.visibleAssetItems.count)）")
+        .navigationTitle(libraryTitle)
         .navigationSplitViewColumnWidth(min: 340, ideal: 420, max: 520)
+    }
+
+    /// 筛选激活时标题给出"结果/总数"的比例；无筛选时保持原样。
+    private var libraryTitle: String {
+        guard !model.hasSearch else { return "搜索结果" }
+        let shown = model.visibleAssetItems.count
+        return model.libraryFilter.isActive
+            ? "媒体（\(shown)/\(model.scopedAssetCount)）"
+            : "媒体（\(shown)）"
+    }
+
+    /// 媒体列表筛选栏。维度控件常显，激活状态由控件自身呈现，只额外
+    /// 提供一个清除按钮；排序是独立意图，不参与筛选激活判定。
+    private var filterBar: some View {
+        HStack(spacing: 8) {
+            Picker("类型", selection: kindFilterBinding) {
+                Text("全部").tag(MediaKind?.none)
+                Text("视频").tag(MediaKind?.some(.video))
+                Text("图片").tag(MediaKind?.some(.image))
+            }
+            .pickerStyle(.segmented)
+            .controlSize(.small)
+            .fixedSize()
+            .help("按媒体类型筛选")
+
+            progressFilterMenu
+            durationFilterMenu
+
+            TextField("路径或文件名", text: $model.libraryFilter.pathQuery)
+                .textFieldStyle(.roundedBorder)
+                .controlSize(.small)
+                .frame(minWidth: 60, maxWidth: 140)
+                .help("按相对路径包含筛选，大小写不敏感")
+
+            Spacer(minLength: 4)
+
+            sortMenu
+
+            if model.libraryFilter.isActive {
+                Button {
+                    model.clearLibraryFilter()
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help("清除全部筛选条件")
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+    }
+
+    /// 切到"图片"时随手清掉时长条件：图片不参与时长筛选，残留条件会
+    /// 变成看不见的空结果来源，宁可让用户重新点一次。
+    private var kindFilterBinding: Binding<MediaKind?> {
+        Binding(
+            get: { model.libraryFilter.mediaKind },
+            set: { newValue in
+                model.libraryFilter.mediaKind = newValue
+                if newValue == .image, model.libraryFilter.duration != nil {
+                    model.libraryFilter.duration = nil
+                }
+            }
+        )
+    }
+
+    private var progressFilterMenu: some View {
+        Menu {
+            // .inline 让选项带勾选标记直接平铺在菜单里；默认样式会被
+            // 渲染成一层多余的子菜单。
+            Picker("处理进度", selection: $model.libraryFilter.progress) {
+                Text("全部").tag(AssetProcessingBucket?.none)
+                ForEach(AssetProcessingBucket.allCases, id: \.self) { bucket in
+                    Text("\(bucket.label)（\(model.filterCounts.progress[bucket] ?? 0)）")
+                        .tag(AssetProcessingBucket?.some(bucket))
+                }
+            }
+            .pickerStyle(.inline)
+            .labelsHidden()
+        } label: {
+            HStack(spacing: 3) {
+                if model.libraryFilter.progress != nil {
+                    Image(systemName: "line.3.horizontal.decrease.circle.fill")
+                }
+                Text(model.libraryFilter.progress?.label ?? "进度")
+            }
+        }
+        .controlSize(.small)
+        .fixedSize()
+        .help("按处理进度筛选，口径与侧栏队列一致")
+    }
+
+    private var durationFilterMenu: some View {
+        Menu {
+            Picker("时长", selection: $model.libraryFilter.duration) {
+                Text("全部").tag(DurationBucket?.none)
+                ForEach(DurationBucket.allCases, id: \.self) { bucket in
+                    Text("\(bucket.label)（\(model.filterCounts.duration[bucket] ?? 0)）")
+                        .tag(DurationBucket?.some(bucket))
+                }
+            }
+            .pickerStyle(.inline)
+            .labelsHidden()
+        } label: {
+            HStack(spacing: 3) {
+                if model.libraryFilter.duration != nil {
+                    Image(systemName: "line.3.horizontal.decrease.circle.fill")
+                }
+                Text(model.libraryFilter.duration?.label ?? "时长")
+            }
+        }
+        .controlSize(.small)
+        .fixedSize()
+        .disabled(model.libraryFilter.mediaKind == .image)
+        .opacity(model.libraryFilter.mediaKind == .image ? 0.45 : 1)
+        .help("按时长筛选；仅作用于视频，激活时图片不参与")
+    }
+
+    private var sortMenu: some View {
+        Menu {
+            Picker("排序依据", selection: $model.librarySort.key) {
+                ForEach(LibrarySortKey.allCases, id: \.self) { key in
+                    Text(key.label).tag(key)
+                }
+            }
+            .pickerStyle(.inline)
+            .labelsHidden()
+            Button(model.librarySort.ascending ? "改为降序" : "改为升序") {
+                model.librarySort.ascending.toggle()
+            }
+            if !model.librarySort.isDefault {
+                Divider()
+                Button("恢复默认排序") {
+                    model.librarySort = LibrarySort()
+                }
+            }
+        } label: {
+            HStack(spacing: 3) {
+                Image(systemName: "arrow.up.arrow.down")
+                if !model.librarySort.isDefault {
+                    Text(sortAbbreviation)
+                }
+            }
+        }
+        .controlSize(.small)
+        .fixedSize()
+        .help("排序")
+    }
+
+    private var sortAbbreviation: String {
+        model.librarySort.key.label + (model.librarySort.ascending ? "↑" : "↓")
+    }
+
+    /// 空态消息：内容列 VStack 的其余行都是定高，空态若按自身理想高度
+    /// 布局，整列会塌缩并被导航列垂直居中（搜索栏、筛选栏跟着跑到页面
+    /// 中间）。统一占满剩余高度：搜索栏留在顶部，空态消息在余下区域居中。
+    private func emptyState<Content: View>(@ViewBuilder _ content: () -> Content) -> some View {
+        content()
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     @ViewBuilder
     private var searchResults: some View {
         if model.isSearching && model.searchResults.isEmpty {
-            ContentUnavailableView {
-                ProgressView()
-            } description: {
-                Text("正在搜索已入库片段…")
+            emptyState {
+                ContentUnavailableView {
+                    ProgressView()
+                } description: {
+                    Text("正在搜索已入库片段…")
+                }
             }
         } else if model.searchResults.isEmpty {
-            ContentUnavailableView(
-                "没有找到片段",
-                systemImage: "magnifyingglass",
-                description: Text("当前会立即搜索已入库片段；后台处理中新增的片段会陆续加入结果。")
-            )
+            emptyState {
+                ContentUnavailableView(
+                    "没有找到片段",
+                    systemImage: "magnifyingglass",
+                    description: Text("当前会立即搜索已入库片段；后台处理中新增的片段会陆续加入结果。")
+                )
+            }
         } else {
             List(model.searchResults) { result in
                 searchResultRow(result)
@@ -609,15 +563,18 @@ struct ContentView: View {
     private func searchResultRow(_ result: SearchResult) -> some View {
         VStack(alignment: .leading, spacing: 7) {
             HStack {
-                Image(systemName: "play.rectangle.fill")
+                Image(systemName: result.asset.hasTimeline ? "play.rectangle.fill" : "photo.fill")
                     .foregroundStyle(Color.accentColor)
                 Text(result.asset.filename)
                     .font(.headline)
                     .lineLimit(1)
                 Spacer()
-                Text("\(formatTime(result.playbackStartMS))–\(formatTime(result.playbackEndMS))")
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(.secondary)
+                // 图片的时间字段是名义值，不向用户展示。
+                if result.asset.hasTimeline {
+                    Text("\(formatTime(result.playbackStartMS))–\(formatTime(result.playbackEndMS))")
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
             }
             if result.evidence.isEmpty {
                 HStack(alignment: .firstTextBaseline, spacing: 6) {
@@ -672,7 +629,7 @@ struct ContentView: View {
             }
             .font(.caption.monospacedDigit())
             Text(
-                "命中：视频描述 \(result.visualDescriptionSegmentCount) 段 · "
+                "命中：画面描述 \(result.visualDescriptionSegmentCount) 段 · "
                     + "OCR \(result.ocrMatchCount) 条 · ASR \(result.asrMatchCount) 条 · "
                     + "候选片段 \(result.matchedSegmentCount)"
             )
@@ -688,10 +645,24 @@ struct ContentView: View {
     @ViewBuilder
     private var assetList: some View {
         if model.visibleAssetItems.isEmpty {
-            ContentUnavailableView {
-                Label("还没有视频", systemImage: "film.stack")
-            } description: {
-                Text(model.roots.isEmpty ? "添加目录或单个视频后会自动开始只读扫描。" : "点击工具栏中的“重新扫描”。")
+            if model.libraryFilter.isActive, model.scopedAssetCount > 0 {
+                emptyState {
+                    ContentUnavailableView {
+                        Label("没有符合筛选条件的媒体", systemImage: "line.3.horizontal.decrease.circle")
+                    } description: {
+                        Text("当前库选择下有媒体，但没有同时满足全部筛选条件的。")
+                    } actions: {
+                        Button("清除筛选") { model.clearLibraryFilter() }
+                    }
+                }
+            } else {
+                emptyState {
+                    ContentUnavailableView {
+                        Label("还没有媒体", systemImage: "photo.on.rectangle.angled")
+                    } description: {
+                        Text(model.roots.isEmpty ? "添加目录、视频或图片后会自动开始只读扫描。" : "点击工具栏中的“重新扫描”。")
+                    }
+                }
             }
         } else {
             List {
@@ -704,7 +675,7 @@ struct ContentView: View {
                             Button("重新建库") { model.reprocessAsset(item.asset) }
                             Button("重新生成描述") { model.regenerateAssetDescriptions(item.asset) }
                             Divider()
-                            Button("从媒体库移除该视频", role: .destructive) {
+                            Button("从媒体库移除该媒体", role: .destructive) {
                                 pendingAssetRemoval = item.asset
                             }
                         }
@@ -735,10 +706,14 @@ struct ContentView: View {
                 assetStatusBadge(asset, summary: summary)
             }
             HStack(spacing: 5) {
-                Text(formatDuration(asset.durationMS))
+                if asset.hasTimeline {
+                    Text(formatDuration(asset.durationMS))
+                } else if asset.pixelWidth > 0, asset.pixelHeight > 0 {
+                    Text("\(asset.pixelWidth)×\(asset.pixelHeight)")
+                }
                 Text("·")
                 Text(ByteCountFormatter.string(fromByteCount: asset.fileSize, countStyle: .file))
-                if asset.audioTrackCount == 0 { Text("· 无音轨") }
+                if asset.hasTimeline, asset.audioTrackCount == 0 { Text("· 无音轨") }
                 if asset.relativePath != asset.filename {
                     Text("· \(asset.relativePath)")
                 }
@@ -759,8 +734,9 @@ struct ContentView: View {
         _ asset: MediaAssetRecord,
         summary: AssetProcessingSummary?
     ) -> String {
+        let idleIcon = asset.hasTimeline ? "film" : "photo"
         guard asset.status == .ready else { return "exclamationmark.triangle" }
-        guard let summary else { return "film" }
+        guard let summary else { return idleIcon }
         if summary.failedCount > 0 { return "exclamationmark.triangle" }
         if summary.segmentationStatus == .running
             || summary.evidenceRunning || summary.describeRunning {
@@ -768,7 +744,7 @@ struct ContentView: View {
         }
         if summary.segmentationStatus == .pending
             || summary.evidencePending > 0 || summary.describePending > 0 { return "clock" }
-        guard summary.totalSegments > 0 else { return "film" }
+        guard summary.totalSegments > 0 else { return idleIcon }
         return "checkmark.circle"
     }
 
@@ -796,7 +772,11 @@ struct ContentView: View {
         let text: String
         let color: Color
         if asset.status != .ready {
-            text = asset.status == .missing ? "文件缺失" : "不可播放"
+            switch asset.status {
+            case .missing: text = "文件缺失"
+            case .failed: text = asset.hasTimeline ? "不可播放" : "无法解码"
+            default: text = "不可用"
+            }
             color = .orange
         } else if let summary {
             if summary.failedCount > 0 {
@@ -924,7 +904,9 @@ struct ContentView: View {
         if let asset = model.selectedAsset {
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
-                    if let player = model.player {
+                    if asset.mediaKind == .image {
+                        imagePreviewArea(asset)
+                    } else if let player = model.player {
                         NativePlayerView(player: player)
                             .aspectRatio(16 / 9, contentMode: .fit)
                             .background(.black)
@@ -952,10 +934,12 @@ struct ContentView: View {
                     }
 
                     if let result = model.selectedResult {
-                        LabeledContent(
-                            "命中位置",
-                            value: "\(formatTime(result.playbackStartMS))–\(formatTime(result.playbackEndMS))"
-                        )
+                        if result.asset.hasTimeline {
+                            LabeledContent(
+                                "命中位置",
+                                value: "\(formatTime(result.playbackStartMS))–\(formatTime(result.playbackEndMS))"
+                            )
+                        }
                         evidenceSection(result)
                         descriptionSection(for: result.segment.id, describeStatus: nil)
                     } else {
@@ -967,10 +951,44 @@ struct ContentView: View {
             }
             .navigationTitle(asset.filename)
         } else {
+            VStack(spacing: 14) {
+                BrandIconView(size: 92)
+                VStack(spacing: 4) {
+                    Text("选择一个媒体或搜索结果")
+                        .font(.title3.weight(.medium))
+                    Text("点击结果会直接从命中位置打开原文件。")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+    }
+
+    /// 图片详情预览：解码后的降采样图，随窗口缩放。
+    @ViewBuilder
+    private func imagePreviewArea(_ asset: MediaAssetRecord) -> some View {
+        if let image = model.imagePreview {
+            Image(nsImage: image)
+                .resizable()
+                .aspectRatio(contentMode: .fit)
+                .frame(maxWidth: .infinity)
+                .clipShape(RoundedRectangle(cornerRadius: 10))
+                .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 10))
+        } else if model.isPlayerLoading {
+            HStack(spacing: 10) {
+                ProgressView().controlSize(.small)
+                Text("正在读取图片…")
+                    .foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity)
+            .padding(44)
+            .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 10))
+        } else {
             ContentUnavailableView(
-                "选择一个视频或搜索结果",
-                systemImage: "play.rectangle",
-                description: Text("点击结果会直接从命中时间播放原文件。")
+                "无法显示",
+                systemImage: "photo",
+                description: Text(model.playerError ?? asset.errorMessage ?? "该图片当前不可用。")
             )
         }
     }
@@ -990,9 +1008,11 @@ struct ContentView: View {
                             .foregroundStyle(.secondary)
                         VStack(alignment: .leading, spacing: 2) {
                             Text(evidence.text).textSelection(.enabled)
-                            Text("\(formatTime(evidence.startMS))–\(formatTime(evidence.endMS))")
-                                .font(.caption.monospacedDigit())
-                                .foregroundStyle(.secondary)
+                            if result.asset.hasTimeline {
+                                Text("\(formatTime(evidence.startMS))–\(formatTime(evidence.endMS))")
+                                    .font(.caption.monospacedDigit())
+                                    .foregroundStyle(.secondary)
+                            }
                         }
                     }
                 }
@@ -1063,11 +1083,18 @@ struct ContentView: View {
                     "大小",
                     value: ByteCountFormatter.string(fromByteCount: asset.fileSize, countStyle: .file)
                 )
-                LabeledContent("时长", value: formatDuration(asset.durationMS))
-                LabeledContent(
-                    "轨道",
-                    value: "视频 \(asset.videoTrackCount) · 音频 \(asset.audioTrackCount)"
-                )
+                if asset.hasTimeline {
+                    LabeledContent("时长", value: formatDuration(asset.durationMS))
+                    LabeledContent(
+                        "轨道",
+                        value: "视频 \(asset.videoTrackCount) · 音频 \(asset.audioTrackCount)"
+                    )
+                } else {
+                    LabeledContent("类型", value: "图片")
+                    if asset.pixelWidth > 0, asset.pixelHeight > 0 {
+                        LabeledContent("尺寸", value: "\(asset.pixelWidth)×\(asset.pixelHeight)")
+                    }
+                }
                 LabeledContent("状态", value: assetStatusText(asset))
                 LabeledContent("修改时间", value: asset.modificationDate.formatted(date: .abbreviated, time: .shortened))
                 LabeledContent("最近发现", value: asset.lastSeenAt.formatted(date: .abbreviated, time: .shortened))
@@ -1084,7 +1111,7 @@ struct ContentView: View {
                     )
                 }
             }
-            if asset.audioTrackCount == 0 {
+            if asset.hasTimeline, asset.audioTrackCount == 0 {
                 Text("无音轨，无法语音识别")
                     .font(.caption)
                     .foregroundStyle(.orange)
@@ -1108,7 +1135,12 @@ struct ContentView: View {
 
     private func assetStatusText(_ asset: MediaAssetRecord) -> String {
         switch asset.status {
-        case .ready: asset.isPlayable ? "就绪，可播放" : "可读取但当前不可播放"
+        case .ready:
+            if asset.hasTimeline {
+                asset.isPlayable ? "就绪，可播放" : "可读取但当前不可播放"
+            } else {
+                asset.isPlayable ? "就绪，可查看" : "可读取但当前无法解码"
+            }
         case .failed: "识别失败"
         case .missing: "文件已缺失"
         }
@@ -1125,18 +1157,20 @@ struct ContentView: View {
                     Label("重新生成描述", systemImage: "sparkles")
                 }
                 .controlSize(.small)
-                .help("丢弃该视频全部描述缓存并重新生成，不影响证据与索引")
+                .help("丢弃该媒体全部描述缓存并重新生成，不影响证据与索引")
                 Button {
                     model.reprocessAsset(asset)
                 } label: {
                     Label("重新建库", systemImage: "arrow.clockwise")
                 }
                 .controlSize(.small)
-                .help("重跑该视频全部片段的 ASR、对齐、OCR 与向量；描述会自动重新生成")
+                .help("重跑该媒体全部片段的识别与向量；描述会自动重新生成")
             }
             if let detail = model.assetDetail {
                 if detail.segments.isEmpty {
-                    Text("该视频正在分析内容边界；完成后会生成变长语义片段。")
+                    Text(asset.hasTimeline
+                        ? "该视频正在分析内容边界；完成后会生成变长语义片段。"
+                        : "该图片正在排队建库；完成后会生成整图的单一片段。")
                         .font(.callout)
                         .foregroundStyle(.secondary)
                 } else {
@@ -1145,11 +1179,11 @@ struct ContentView: View {
                         spacing: 10
                     ) {
                         ForEach(detail.segments) { info in
-                            segmentCard(info, detail: detail)
+                            segmentCard(info, detail: detail, hasTimeline: asset.hasTimeline)
                         }
                     }
                     if let selected = detail.segments.first(where: { $0.segment.id == selectedSegmentID }) {
-                        selectedSegmentPanel(selected, detail: detail)
+                        selectedSegmentPanel(selected, detail: detail, hasTimeline: asset.hasTimeline)
                     }
                 }
             } else {
@@ -1165,7 +1199,8 @@ struct ContentView: View {
     /// 片段卡片：关键帧胶条 + 片段号/时间 + 建库状态。点击播放并展开详情。
     private func segmentCard(
         _ info: AssetSegmentInfo,
-        detail: AssetLibraryDetail
+        detail: AssetLibraryDetail,
+        hasTimeline: Bool
     ) -> some View {
         let isSelected = selectedSegmentID == info.segment.id
         return VStack(alignment: .leading, spacing: 6) {
@@ -1173,9 +1208,12 @@ struct ContentView: View {
             HStack(spacing: 6) {
                 Text("片段 \(info.segment.ordinal + 1)")
                     .font(.callout.weight(.medium))
-                Text("\(formatTime(info.segment.startMS))–\(formatTime(info.segment.endMS))")
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(.secondary)
+                // 图片的名义段时间不向用户展示。
+                if hasTimeline {
+                    Text("\(formatTime(info.segment.startMS))–\(formatTime(info.segment.endMS))")
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
                 Spacer()
                 if info.isIndexed {
                     Image(systemName: "checkmark.circle.fill")
@@ -1264,20 +1302,24 @@ struct ContentView: View {
     /// 选中的片段详情：完整证据、描述与重跑入口。
     private func selectedSegmentPanel(
         _ info: AssetSegmentInfo,
-        detail: AssetLibraryDetail
+        detail: AssetLibraryDetail,
+        hasTimeline: Bool
     ) -> some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(spacing: 8) {
-                Label(
-                    "片段 \(info.segment.ordinal + 1) · \(formatTime(info.segment.startMS))–\(formatTime(info.segment.endMS))",
-                    systemImage: "waveform.path"
-                )
+                Label {
+                    Text(hasTimeline
+                        ? "片段 \(info.segment.ordinal + 1) · \(formatTime(info.segment.startMS))–\(formatTime(info.segment.endMS))"
+                        : "片段 \(info.segment.ordinal + 1)")
+                } icon: {
+                    Image(systemName: "waveform.path")
+                }
                 .font(.headline)
                 Spacer()
                 Button {
                     model.playFromSegment(info.segment)
                 } label: {
-                    Label("播放", systemImage: "play.fill")
+                    Label(hasTimeline ? "播放" : "查看", systemImage: hasTimeline ? "play.fill" : "photo")
                 }
                 .controlSize(.small)
             }
@@ -1370,7 +1412,7 @@ struct ContentView: View {
     private func chooseMedia() {
         let panel = NSOpenPanel()
         panel.title = "选择媒体"
-        panel.message = "选择整个目录、多个视频或单个视频；Media Memory 只会读取所选内容。"
+        panel.message = "选择整个目录、多个视频或图片；Media Memory 只会读取所选内容。"
         panel.prompt = "添加"
         panel.canChooseFiles = true
         panel.canChooseDirectories = true
@@ -1439,15 +1481,20 @@ private struct NativePlayerView: NSViewRepresentable {
     }
 }
 
-/// 窗口内空格键只有一个处理入口。文本正在编辑时原样放行；其余情况下，
-/// 只要当前有播放器，就由 AppModel 切换一次播放状态并消费该事件。
+/// 窗口输入纪律，两条规则：
+/// 1. 空格键只有一个处理入口——文本编辑期间原样放行；其余情况下，只要
+///    当前有播放器，就由 AppModel 切换一次播放状态并消费该事件。
+/// 2. 点击落在 field editor 之外时结束文本编辑。SwiftUI 的列表、详情区
+///    不接收第一响应者，点击别处不会自动结束编辑，field editor 会一直
+///    隐身留存并截留后续按键（空格进搜索框、播放/暂停失效的根源）。
 @MainActor
-private final class PlaybackKeyMonitor: ObservableObject {
-    private var token: Any?
+private final class WindowInputMonitor: ObservableObject {
+    private var keyDownToken: Any?
+    private var mouseDownToken: Any?
 
     func start(model: AppModel) {
-        guard token == nil else { return }
-        token = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak model] event in
+        guard keyDownToken == nil else { return }
+        keyDownToken = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak model] event in
             guard let model,
                   let eventWindow = event.window,
                   eventWindow === NSApp.mainWindow,
@@ -1466,12 +1513,31 @@ private final class PlaybackKeyMonitor: ObservableObject {
             model.togglePlayback()
             return nil
         }
+        mouseDownToken = NSEvent.addLocalMonitorForEvents(
+            matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown]
+        ) { event in
+            Self.endEditingOutsideFieldEditor(event)
+            return event
+        }
     }
 
     func stop() {
-        guard let token else { return }
-        NSEvent.removeMonitor(token)
-        self.token = nil
+        for token in [keyDownToken, mouseDownToken] {
+            if let token { NSEvent.removeMonitor(token) }
+        }
+        keyDownToken = nil
+        mouseDownToken = nil
+    }
+
+    /// 点在 field editor 之内则放行，让这次点击正常完成光标定位与选区
+    /// 调整；之外先结束编辑再放行，点击本身（按钮、列表行）不受影响。
+    private static func endEditingOutsideFieldEditor(_ event: NSEvent) {
+        guard let window = event.window,
+              let editor = window.firstResponder as? NSTextView,
+              editor.isFieldEditor else { return }
+        let editorFrame = editor.convert(editor.bounds, to: nil)
+        guard !editorFrame.contains(event.locationInWindow) else { return }
+        window.makeFirstResponder(nil)
     }
 
     private static func isEditingText(in window: NSWindow) -> Bool {
@@ -1615,12 +1681,41 @@ private struct SegmentDescriptionContent: View {
     }
 }
 
+/// App 品牌图标：运行时读 bundle 图标，与 Dock/Finder 永远同源。
+/// 不走资源目录，SwiftPM 打包链路只维护 Packaging/AppIcon 一处图标资产。
+struct BrandIconView: View {
+    var size: CGFloat
+
+    var body: some View {
+        Image(nsImage: NSApp.applicationIconImage)
+            .resizable()
+            .interpolation(.high)
+            .frame(width: size, height: size)
+            .clipShape(RoundedRectangle(cornerRadius: size * 0.2, style: .continuous))
+            .shadow(color: .black.opacity(0.14), radius: 4, y: 2)
+    }
+}
+
 private struct ModelSettingsView: View {
     @ObservedObject var model: AppModel
     @State private var showAdvanced = false
 
     var body: some View {
         VStack(spacing: 0) {
+            HStack(spacing: 12) {
+                BrandIconView(size: 46)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Media Memory")
+                        .font(.headline)
+                    Text("模型服务 · 版本 \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "–")")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+            }
+            .padding(.horizontal, 20)
+            .padding(.top, 16)
+            .padding(.bottom, 4)
             Form {
                 Section("连接方式") {
                     Text("Media Memory 只要求接口兼容，不限制服务商。URL 可以指向本机或远程服务；涉及个人媒体时建议优先使用本机服务。")
@@ -1629,7 +1724,7 @@ private struct ModelSettingsView: View {
                     if model.isSettingsLoading {
                         HStack {
                             ProgressView().controlSize(.small)
-                            Text("正在从钥匙串读取模型密钥…")
+                            Text("正在读取模型密钥…")
                                 .foregroundStyle(.secondary)
                         }
                     }
@@ -1775,11 +1870,11 @@ private struct ModelEndpointEditor: View {
             TextField("模型名称", text: $draft.modelID)
             if draft.transport.requiresEndpoint, draft.authentication == .bearer {
                 SecureField("API key", text: $draft.apiKey)
-                Text("密钥只保存在 macOS 钥匙串；测试使用应用生成的音频和图片，不读取媒体库。")
+                Text("密钥只保存在本机凭据文件（仅当前用户可读写）；测试使用应用生成的音频和图片，不读取媒体库。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             } else if draft.transport.requiresEndpoint {
-                Text("无需鉴权时不会读取或写入该能力的钥匙串项目。")
+                Text("无需鉴权时不会读取或写入该能力的密钥。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

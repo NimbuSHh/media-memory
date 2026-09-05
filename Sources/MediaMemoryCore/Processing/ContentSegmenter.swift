@@ -48,14 +48,17 @@ public actor ContentSegmenter {
     ) async throws -> TimelineFeatureExtractionResult
 
     public static let algorithmFamily = "semantic-v2-visual-silence-v2"
+    public static let imageAlgorithmFamily = "static-single-v1"
 
     private let database: MediaDatabase
     private let sourceCache: LocalSourceCache
     private let featureConfiguration: TimelineFeatureExtractionConfiguration
     private let planner: SemanticSegmentPlanner
     private let extractFeatures: FeatureExtractor
-    private let algorithmVersion: String
-    private let parametersJSON: String
+    /// 每种媒体类型独立的算法身份：视频沿用特征参数摘要，图片是常量
+    /// 单段算法。reconcile 与提交都按资产类型取对应版本。
+    private let algorithmVersionByKind: [MediaKind: String]
+    private let parametersJSONByKind: [MediaKind: String]
 
     public init(
         database: MediaDatabase,
@@ -77,28 +80,36 @@ public actor ContentSegmenter {
         self.featureConfiguration = effectiveConfiguration
         self.planner = planner
         self.extractFeatures = extractFeatures
-        let parameterValues = Self.parameterValues(
+        let videoParameterValues = Self.parameterValues(
             featureConfiguration: effectiveConfiguration,
             plannerConfiguration: planner.effectiveConfiguration
         )
-        let canonicalData = try? JSONSerialization.data(
-            withJSONObject: parameterValues,
-            options: [.sortedKeys]
+        let videoVersion = Self.makeAlgorithmVersion(
+            family: Self.algorithmFamily,
+            parameterValues: videoParameterValues
         )
-        let digest = SHA256.hash(data: canonicalData ?? Data())
-            .map { String(format: "%02x", $0) }
-            .joined()
-        let version = "\(Self.algorithmFamily)-\(digest.prefix(12))"
-        algorithmVersion = version
-        parametersJSON = Self.makeParametersJSON(
-            values: parameterValues,
-            algorithmVersion: version
-        )
+        algorithmVersionByKind = [
+            .video: videoVersion,
+            .image: Self.makeAlgorithmVersion(
+                family: Self.imageAlgorithmFamily,
+                parameterValues: [:]
+            )
+        ]
+        parametersJSONByKind = [
+            .video: Self.makeParametersJSON(
+                values: videoParameterValues,
+                algorithmVersion: videoVersion
+            ),
+            .image: Self.makeParametersJSON(
+                values: [:],
+                algorithmVersion: algorithmVersionByKind[.image]!
+            )
+        ]
     }
 
     public func prepareQueue() async throws -> IndexingProgress {
         try await database.reconcileSegmentationJobs(
-            algorithmVersion: algorithmVersion
+            algorithmVersionByKind: algorithmVersionByKind
         )
     }
 
@@ -199,27 +210,44 @@ public actor ContentSegmenter {
         onEvent: EventHandler?
     ) async throws {
         try await stage("analyzing", target: target, onEvent: onEvent)
-        let features = try await AsyncTimeout.run(
-            for: analysisTimeout(durationMS: target.asset.durationMS),
-            operationName: "分析视频分片边界"
-        ) { [sourceCache, featureConfiguration, extractFeatures] in
-            try await sourceCache.withLocalURL(for: target.asset) { sourceURL in
-                try await extractFeatures(sourceURL, featureConfiguration)
+        // 图片没有时间轴特征：跳过特征提取，边界候选为空时 planner 对
+        // 名义时长恰好产出覆盖全部内容的单一段。
+        let boundaryEvidence: (
+            candidates: [SemanticBoundaryCandidate],
+            observations: [TimelineBoundaryObservationDraft]
+        )
+        var decodedDurationMS: Int64?
+        if target.asset.mediaKind == .image {
+            boundaryEvidence = ([], [])
+        } else {
+            let features = try await AsyncTimeout.run(
+                for: analysisTimeout(durationMS: target.asset.durationMS),
+                operationName: "分析视频分片边界"
+            ) { [sourceCache, featureConfiguration, extractFeatures] in
+                try await sourceCache.withLocalURL(for: target.asset) { sourceURL in
+                    try await extractFeatures(sourceURL, featureConfiguration)
+                }
             }
+            try Task.checkCancellation()
+            decodedDurationMS = features.durationMS
+            boundaryEvidence = (
+                features.candidates.compactMap(Self.boundaryCandidate),
+                features.candidates.map(Self.boundaryObservation)
+            )
         }
-        try Task.checkCancellation()
+        let candidates = boundaryEvidence.candidates
+        let observations = boundaryEvidence.observations
 
         try await stage("planning", target: target, onEvent: onEvent)
-        let candidates = features.candidates.compactMap(Self.boundaryCandidate)
-        let observations = features.candidates.map(Self.boundaryObservation)
         // 时长交叉验证：解码得到的 PTS 时长是比容器探测更强的证据。
         // 候选与解码一致 → 证实漂移；解码与权威值一致 → 候选是探测误报，
         // 放弃修正、保留现有代际；两者都不同 → 以解码时长为准。
+        // 图片没有解码时长，也永远不会产生漂移候选（名义时长恒定）。
         let authoritativeDurationMS = target.asset.durationMS
         let plannedDurationMS: Int64
         var confirmedCandidateMS: Int64?
-        if let candidateMS = target.candidateDurationMS {
-            let decodedMS = features.durationMS
+        if let candidateMS = target.candidateDurationMS,
+           let decodedMS = decodedDurationMS {
             if abs(decodedMS - candidateMS) <= TimelineDriftPolicy.toleranceMS {
                 plannedDurationMS = candidateMS
                 confirmedCandidateMS = candidateMS
@@ -254,8 +282,8 @@ public actor ContentSegmenter {
             claim: target.job.claimToken,
             assetID: target.asset.id,
             sourceFingerprint: target.asset.fingerprint,
-            algorithmVersion: algorithmVersion,
-            parametersJSON: parametersJSON,
+            algorithmVersion: algorithmVersionByKind[target.asset.mediaKind]!,
+            parametersJSON: parametersJSONByKind[target.asset.mediaKind]!,
             segments: drafts,
             observations: observations,
             candidateDurationMS: confirmedCandidateMS
@@ -380,6 +408,20 @@ public actor ContentSegmenter {
             "planner_boundary_merge_tolerance_ms": planner.boundaryMergeToleranceMS,
             "planner_minimum_boundary_strength": planner.minimumBoundaryStrength
         ]
+    }
+
+    private static func makeAlgorithmVersion(
+        family: String,
+        parameterValues: [String: Any]
+    ) -> String {
+        let canonicalData = try? JSONSerialization.data(
+            withJSONObject: parameterValues,
+            options: [.sortedKeys]
+        )
+        let digest = SHA256.hash(data: canonicalData ?? Data())
+            .map { String(format: "%02x", $0) }
+            .joined()
+        return "\(family)-\(digest.prefix(12))"
     }
 
     private static func makeParametersJSON(

@@ -25,7 +25,9 @@ public enum MediaDatabaseDerivationError: Error, LocalizedError, Sendable {
 
 extension MediaDatabase {
     /// One asset owns all background processing lanes at a time. A running
-    /// asset remains sticky; otherwise the first path with pending work wins.
+    /// asset remains sticky; otherwise the pending asset from the first
+    /// library in processing order wins (library_root.processing_rank, then
+    /// path order as tie-break within a library).
     func activeProcessingAssetID() throws -> String? {
         let running = try connection.prepare(
             """
@@ -49,6 +51,7 @@ extension MediaDatabase {
             """
             SELECT a.id
             FROM media_asset a
+            JOIN library_root r ON r.id = a.root_id
             WHERE a.status = 'ready'
               AND a.invalidated_at IS NULL
               AND a.is_excluded = 0
@@ -58,9 +61,10 @@ extension MediaDatabase {
                     AND j.kind IN ('segment_asset', 'index_segment', 'describe_segment')
                     AND j.status = 'pending'
               )
-            ORDER BY a.relative_path COLLATE NOCASE,
-            a.standardized_path COLLATE NOCASE,
-            a.id
+            ORDER BY r.processing_rank,
+                     a.relative_path COLLATE NOCASE,
+                     a.standardized_path COLLATE NOCASE,
+                     a.id
             LIMIT 1
             """
         )
@@ -178,10 +182,44 @@ extension MediaDatabase {
         return try incomplete.step()
     }
 
+    /// 仅 reconcile 视频配方的兼容入口：图片资产存在的库必须走
+    /// `inputVersionByKind:` 全量入口，否则图片向量会被永久判旧。
     public func reconcileIndexJobs(
         embeddingModelID: String,
         inputVersion: String,
         now: Date = Date()
+    ) throws {
+        try reconcileIndexJobs(
+            embeddingModelID: embeddingModelID,
+            inputVersionByKind: [.video: inputVersion],
+            now: now
+        )
+    }
+
+    /// 每种媒体类型按各自的建库配方身份 reconcile：图片配方不含 ASR/
+    /// 对齐模型，视频配方变更不影响图片向量，反之亦然。
+    /// 每个类型一个事务，互相独立提交。
+    public func reconcileIndexJobs(
+        embeddingModelID: String,
+        inputVersionByKind: [MediaKind: String],
+        now: Date = Date()
+    ) throws {
+        for kind in MediaKind.allCases {
+            guard let inputVersion = inputVersionByKind[kind] else { continue }
+            try reconcileIndexJobs(
+                forKind: kind,
+                embeddingModelID: embeddingModelID,
+                inputVersion: inputVersion,
+                now: now
+            )
+        }
+    }
+
+    private func reconcileIndexJobs(
+        forKind kind: MediaKind,
+        embeddingModelID: String,
+        inputVersion: String,
+        now: Date
     ) throws {
         try connection.inTransaction {
             let invalidate = try connection.prepare(
@@ -193,14 +231,18 @@ extension MediaDatabase {
                   AND segment_id IN (
                       SELECT e.segment_id
                       FROM segment_embedding e
-                      WHERE e.model_id <> ? OR e.input_version <> ?
+                      JOIN segment s ON s.id = e.segment_id
+                      JOIN media_asset a ON a.id = s.asset_id
+                      WHERE a.media_kind = ?
+                        AND (e.model_id <> ? OR e.input_version <> ?)
                   )
                 """
             )
             try invalidate.bind(.text(checkpoint(stage: "model_changed")), at: 1)
             try invalidate.bind(.real(now.timeIntervalSince1970), at: 2)
-            try invalidate.bind(.text(embeddingModelID), at: 3)
-            try invalidate.bind(.text(inputVersion), at: 4)
+            try invalidate.bind(.text(kind.rawValue), at: 3)
+            try invalidate.bind(.text(embeddingModelID), at: 4)
+            try invalidate.bind(.text(inputVersion), at: 5)
             _ = try invalidate.step()
 
             let enqueue = try connection.prepare(
@@ -222,6 +264,7 @@ extension MediaDatabase {
                 WHERE a.status = 'ready'
                   AND a.invalidated_at IS NULL
                   AND a.is_excluded = 0
+                  AND a.media_kind = ?
                   AND (
                     s.is_active = 1
                     OR EXISTS (
@@ -247,6 +290,7 @@ extension MediaDatabase {
             try enqueue.bind(.real(now.timeIntervalSince1970), at: 3)
             try enqueue.bind(.text(embeddingModelID), at: 4)
             try enqueue.bind(.text(inputVersion), at: 5)
+            try enqueue.bind(.text(kind.rawValue), at: 6)
             _ = try enqueue.step()
         }
     }
@@ -475,6 +519,7 @@ extension MediaDatabase {
                    a.video_track_count, a.audio_track_count, a.is_playable,
                    a.fingerprint, a.status, a.error_message,
                    a.first_seen_at, a.last_seen_at,
+                   a.media_kind, a.pixel_width, a.pixel_height,
                    s.id, s.asset_id, s.ordinal, s.start_ms, s.end_ms,
                    s.segmentation_version,
                    \(requiresEmbedding ? "e.derivation_run_id" : "NULL")
@@ -502,7 +547,7 @@ extension MediaDatabase {
               let assetID = query.text(at: 1),
               let segmentID = query.text(at: 2),
               let asset = assetRecord(from: query, offset: 9),
-              let segment = segmentRecord(from: query, offset: 24) else {
+              let segment = segmentRecord(from: query, offset: 27) else {
             return nil
         }
         return NextJobRow(
@@ -513,7 +558,7 @@ extension MediaDatabase {
             createdAt: Date(timeIntervalSince1970: query.real(at: 7)),
             asset: asset,
             segment: segment,
-            descriptionInputRevision: query.text(at: 30)
+            descriptionInputRevision: query.text(at: 33)
         )
     }
 
@@ -734,10 +779,24 @@ extension MediaDatabase {
         return summaries
     }
 
-    /// 配置性过期（prompt 或描述模型变化）的描述数量；只统计，不重跑。
+    /// 单一配方版本的兼容入口（等价于两种媒体共用同一期望 prompt）。
     public func staleDescriptionCount(
         descriptionModelID: String,
         promptVersion: String
+    ) throws -> Int {
+        try staleDescriptionCount(
+            descriptionModelID: descriptionModelID,
+            videoPromptVersion: promptVersion,
+            imagePromptVersion: promptVersion
+        )
+    }
+
+    /// 配置性过期（prompt 或描述模型变化）的描述数量；只统计，不重跑。
+    /// prompt 版本按媒体类型独立比较：视频与图片的描述 prompt 各自演进。
+    public func staleDescriptionCount(
+        descriptionModelID: String,
+        videoPromptVersion: String,
+        imagePromptVersion: String
     ) throws -> Int {
         let statement = try connection.prepare(
             """
@@ -750,11 +809,15 @@ extension MediaDatabase {
               AND a.invalidated_at IS NULL
               AND a.is_excluded = 0
               AND s.is_active = 1
-              AND (d.prompt_version <> ? OR r.model_id <> ?)
+              AND (
+                d.prompt_version <> CASE a.media_kind WHEN 'image' THEN ? ELSE ? END
+                OR r.model_id <> ?
+              )
             """
         )
-        try statement.bind(.text(promptVersion), at: 1)
-        try statement.bind(.text(descriptionModelID), at: 2)
+        try statement.bind(.text(imagePromptVersion), at: 1)
+        try statement.bind(.text(videoPromptVersion), at: 2)
+        try statement.bind(.text(descriptionModelID), at: 3)
         guard try statement.step() else { return 0 }
         return Int(statement.integer(at: 0))
     }
@@ -791,12 +854,37 @@ extension MediaDatabase {
         }
     }
 
-    /// 手动重跑全部配置性过期的描述（prompt/模型变更后的全库刷新入口）。
+    /// 单一配方版本的兼容入口。
     public func requeueStaleDescriptions(
         descriptionModelID: String,
         promptVersion: String,
         now: Date = Date()
     ) throws {
+        try requeueStaleDescriptions(
+            descriptionModelID: descriptionModelID,
+            videoPromptVersion: promptVersion,
+            imagePromptVersion: promptVersion,
+            now: now
+        )
+    }
+
+    /// 手动重跑全部配置性过期的描述（prompt/模型变更后的全库刷新入口）。
+    public func requeueStaleDescriptions(
+        descriptionModelID: String,
+        videoPromptVersion: String,
+        imagePromptVersion: String,
+        now: Date = Date()
+    ) throws {
+        let stalePredicate = """
+            a.status = 'ready'
+              AND a.invalidated_at IS NULL
+              AND a.is_excluded = 0
+              AND s.is_active = 1
+              AND (
+                d.prompt_version <> CASE a.media_kind WHEN 'image' THEN ? ELSE ? END
+                OR r.model_id <> ?
+              )
+            """
         try connection.inTransaction {
             let requeue = try connection.prepare(
                 """
@@ -810,18 +898,15 @@ extension MediaDatabase {
                     JOIN media_asset a ON a.id = s.asset_id
                     JOIN segment_description d ON d.segment_id = s.id
                     JOIN derivation_run r ON r.id = d.derivation_run_id
-                    WHERE a.status = 'ready'
-                      AND a.invalidated_at IS NULL
-                      AND a.is_excluded = 0
-                      AND s.is_active = 1
-                      AND (d.prompt_version <> ? OR r.model_id <> ?)
-                )
+                    WHERE \(stalePredicate)
+                  )
                 """
             )
             try requeue.bind(.text(checkpoint(stage: "requeue")), at: 1)
             try requeue.bind(.real(now.timeIntervalSince1970), at: 2)
-            try requeue.bind(.text(promptVersion), at: 3)
-            try requeue.bind(.text(descriptionModelID), at: 4)
+            try requeue.bind(.text(imagePromptVersion), at: 3)
+            try requeue.bind(.text(videoPromptVersion), at: 4)
+            try requeue.bind(.text(descriptionModelID), at: 5)
             _ = try requeue.step()
 
             let deleteDescriptions = try connection.prepare(
@@ -833,16 +918,13 @@ extension MediaDatabase {
                     JOIN media_asset a ON a.id = s.asset_id
                     JOIN segment_description d ON d.segment_id = s.id
                     JOIN derivation_run r ON r.id = d.derivation_run_id
-                    WHERE a.status = 'ready'
-                      AND a.invalidated_at IS NULL
-                      AND a.is_excluded = 0
-                      AND s.is_active = 1
-                      AND (d.prompt_version <> ? OR r.model_id <> ?)
+                    WHERE \(stalePredicate)
                 )
                 """
             )
-            try deleteDescriptions.bind(.text(promptVersion), at: 1)
-            try deleteDescriptions.bind(.text(descriptionModelID), at: 2)
+            try deleteDescriptions.bind(.text(imagePromptVersion), at: 1)
+            try deleteDescriptions.bind(.text(videoPromptVersion), at: 2)
+            try deleteDescriptions.bind(.text(descriptionModelID), at: 3)
             _ = try deleteDescriptions.step()
         }
     }
@@ -864,6 +946,35 @@ extension MediaDatabase {
 
     public func describeProgress() throws -> IndexingProgress {
         try progress(kind: "describe_segment")
+    }
+
+    /// 每个媒体库的处理队列状态：可调度资产上的 pending/running 任务数与
+    /// 最后一次任务活动时刻。判定口径与 activeProcessingAssetID 一致，
+    /// 供侧栏队列分组与 MCP library_stats 使用。
+    public func libraryRootQueueStates() throws -> [String: LibraryRootQueueState] {
+        let statement = try connection.prepare(
+            """
+            SELECT a.root_id,
+                   SUM(CASE WHEN j.status IN ('pending', 'running') THEN 1 ELSE 0 END),
+                   MAX(j.updated_at)
+            FROM media_asset a
+            LEFT JOIN job j
+              ON j.asset_id = a.id
+             AND j.kind IN ('segment_asset', 'index_segment', 'describe_segment')
+            WHERE a.status = 'ready' AND a.invalidated_at IS NULL AND a.is_excluded = 0
+            GROUP BY a.root_id
+            """
+        )
+        var states: [String: LibraryRootQueueState] = [:]
+        while try statement.step(),
+              let rootID = statement.text(at: 0) {
+            let activity = statement.real(at: 2)
+            states[rootID] = LibraryRootQueueState(
+                pendingJobCount: Int(statement.integer(at: 1)),
+                lastJobActivityAt: activity > 0 ? Date(timeIntervalSince1970: activity) : nil
+            )
+        }
+        return states
     }
 
     /// 一次取回每个视频的处理进度汇总（片段数、向量数、两类任务的
@@ -1023,16 +1134,32 @@ extension MediaDatabase {
         }
     }
 
+    /// 单一配方版本的兼容入口（等价于两种媒体共用同一期望 prompt）。
     public func jobDashboardSnapshot(
         descriptionModelID: String?,
         promptVersion: String?
     ) throws -> JobDashboardSnapshot {
+        try jobDashboardSnapshot(
+            descriptionModelID: descriptionModelID,
+            videoPromptVersion: promptVersion,
+            imagePromptVersion: promptVersion
+        )
+    }
+
+    public func jobDashboardSnapshot(
+        descriptionModelID: String?,
+        videoPromptVersion: String?,
+        imagePromptVersion: String?
+    ) throws -> JobDashboardSnapshot {
         try connection.inReadTransaction {
             let staleCount: Int
-            if let descriptionModelID, let promptVersion {
+            if let descriptionModelID,
+               let videoPromptVersion,
+               let imagePromptVersion {
                 staleCount = try staleDescriptionCount(
                     descriptionModelID: descriptionModelID,
-                    promptVersion: promptVersion
+                    videoPromptVersion: videoPromptVersion,
+                    imagePromptVersion: imagePromptVersion
                 )
             } else {
                 staleCount = 0
@@ -1509,21 +1636,35 @@ extension MediaDatabase {
         return results
     }
 
+    /// 单一配方版本的兼容入口。
     public func storedEmbeddings(modelID: String, inputVersion: String) throws -> [StoredEmbedding] {
+        try storedEmbeddings(modelID: modelID, inputVersions: [inputVersion])
+    }
+
+    /// 当前配方集合内的全部活跃向量。视频与图片配方各自演进，
+    /// 语义索引必须同时装载两种当前版本。
+    public func storedEmbeddings(
+        modelID: String,
+        inputVersions: [String]
+    ) throws -> [StoredEmbedding] {
+        guard !inputVersions.isEmpty else { return [] }
+        let placeholders = inputVersions.map { _ in "?" }.joined(separator: ",")
         let statement = try connection.prepare(
             """
             SELECT e.segment_id, e.dimension, e.vector
             FROM segment_embedding e
             JOIN segment s ON s.id = e.segment_id
             JOIN media_asset a ON a.id = s.asset_id
-            WHERE e.model_id = ? AND e.input_version = ?
+            WHERE e.model_id = ? AND e.input_version IN (\(placeholders))
               AND a.status = 'ready' AND a.invalidated_at IS NULL AND a.is_excluded = 0
               AND s.is_active = 1
             ORDER BY e.segment_id
             """
         )
         try statement.bind(.text(modelID), at: 1)
-        try statement.bind(.text(inputVersion), at: 2)
+        for (index, version) in inputVersions.enumerated() {
+            try statement.bind(.text(version), at: Int32(index + 2))
+        }
         var records: [StoredEmbedding] = []
         while try statement.step() {
             guard let segmentID = statement.text(at: 0),
@@ -1538,20 +1679,32 @@ extension MediaDatabase {
         return records
     }
 
+    /// 单一配方版本的兼容入口。
     public func embeddingIndexRevision(modelID: String, inputVersion: String) throws -> String {
+        try embeddingIndexRevision(modelID: modelID, inputVersions: [inputVersion])
+    }
+
+    public func embeddingIndexRevision(
+        modelID: String,
+        inputVersions: [String]
+    ) throws -> String {
+        guard !inputVersions.isEmpty else { return "0:0:0" }
+        let placeholders = inputVersions.map { _ in "?" }.joined(separator: ",")
         let statement = try connection.prepare(
             """
             SELECT count(*), coalesce(max(e.created_at), 0), coalesce(sum(e.rowid), 0)
             FROM segment_embedding e
             JOIN segment s ON s.id = e.segment_id
             JOIN media_asset a ON a.id = s.asset_id
-            WHERE e.model_id = ? AND e.input_version = ?
+            WHERE e.model_id = ? AND e.input_version IN (\(placeholders))
               AND a.status = 'ready' AND a.invalidated_at IS NULL AND a.is_excluded = 0
               AND s.is_active = 1
             """
         )
         try statement.bind(.text(modelID), at: 1)
-        try statement.bind(.text(inputVersion), at: 2)
+        for (index, version) in inputVersions.enumerated() {
+            try statement.bind(.text(version), at: Int32(index + 2))
+        }
         guard try statement.step() else { return "0:0:0" }
         return "\(statement.integer(at: 0)):\(String(format: "%.17g", statement.real(at: 1))):\(statement.integer(at: 2))"
     }
@@ -1564,6 +1717,7 @@ extension MediaDatabase {
                    a.video_track_count, a.audio_track_count, a.is_playable,
                    a.fingerprint, a.status, a.error_message,
                    a.first_seen_at, a.last_seen_at,
+                   a.media_kind, a.pixel_width, a.pixel_height,
                    s.id, s.asset_id, s.ordinal, s.start_ms, s.end_ms,
                    s.segmentation_version
             FROM segment s
@@ -1605,13 +1759,60 @@ extension MediaDatabase {
         try target.bind(.text(segmentID), at: 1)
         guard try target.step(),
               let asset = assetRecord(from: target, offset: 0),
-              let segment = segmentRecord(from: target, offset: 15) else {
+              let segment = segmentRecord(from: target, offset: 18) else {
             return nil
         }
         return SegmentSearchContext(
             segment: segment,
             asset: asset,
             evidence: try evidence(segmentID: segmentID)
+        )
+    }
+
+    /// 只读检索入口：按扫描提交的相对路径取可见就绪资产。
+    public func asset(relativePath: String) throws -> MediaAssetRecord? {
+        let statement = try connection.prepare(
+            """
+            SELECT id, root_id, relative_path, standardized_path,
+                   file_size, modification_time, duration_ms,
+                   video_track_count, audio_track_count, is_playable,
+                   fingerprint, status, error_message,
+                   first_seen_at, last_seen_at,
+                   media_kind, pixel_width, pixel_height
+            FROM media_asset
+            WHERE relative_path = ?
+              AND status = 'ready' AND invalidated_at IS NULL AND is_excluded = 0
+            ORDER BY first_seen_at
+            LIMIT 1
+            """
+        )
+        try statement.bind(.text(relativePath), at: 1)
+        guard try statement.step() else { return nil }
+        return assetRecord(from: statement, offset: 0)
+    }
+
+    /// 只读概览计数，口径与检索候选一致（可见就绪资产、活动代际片段）。
+    public func libraryStatistics() throws -> MediaLibraryStatistics {
+        let statement = try connection.prepare(
+            """
+            SELECT
+                (SELECT count(*) FROM media_asset
+                 WHERE status = 'ready' AND invalidated_at IS NULL AND is_excluded = 0),
+                (SELECT count(*) FROM segment WHERE is_active = 1),
+                (SELECT count(*) FROM segment_embedding e
+                 JOIN segment s ON s.id = e.segment_id
+                 JOIN media_asset a ON a.id = s.asset_id
+                 WHERE a.status = 'ready' AND a.invalidated_at IS NULL
+                   AND a.is_excluded = 0 AND s.is_active = 1)
+            """
+        )
+        guard try statement.step() else {
+            return MediaLibraryStatistics(assetCount: 0, segmentCount: 0, embeddingCount: 0)
+        }
+        return MediaLibraryStatistics(
+            assetCount: Int(statement.integer(at: 0)),
+            segmentCount: Int(statement.integer(at: 1)),
+            embeddingCount: Int(statement.integer(at: 2))
         )
     }
 
@@ -2103,7 +2304,10 @@ extension MediaDatabase {
             status: status,
             errorMessage: statement.text(at: offset + 12),
             firstSeenAt: Date(timeIntervalSince1970: statement.real(at: offset + 13)),
-            lastSeenAt: Date(timeIntervalSince1970: statement.real(at: offset + 14))
+            lastSeenAt: Date(timeIntervalSince1970: statement.real(at: offset + 14)),
+            mediaKind: MediaKind(rawValue: statement.text(at: offset + 15) ?? "") ?? .video,
+            pixelWidth: Int(statement.integer(at: offset + 16)),
+            pixelHeight: Int(statement.integer(at: offset + 17))
         )
     }
 
