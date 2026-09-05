@@ -48,8 +48,14 @@ contents="$application/Contents"
 /bin/rm -rf "$application"
 /bin/mkdir -p "$contents/MacOS" "$contents/Resources"
 /usr/bin/install -m 755 "$binary_directory/MediaMemoryApp" "$contents/MacOS/MediaMemory"
+/usr/bin/install -m 755 "$binary_directory/media-memory-mcp" "$contents/MacOS/media-memory-mcp"
+# 发布包剥离调试符号（SwiftPM release 二进制默认保留大量符号信息，
+# 不剥离体积约为剥离后的 2.3 倍）。必须在 codesign 之前执行。
+/usr/bin/strip "$contents/MacOS/MediaMemory" "$contents/MacOS/media-memory-mcp"
 /usr/bin/ditto "$binary_directory/MediaMemory_MediaMemoryCore.bundle" \
     "$contents/Resources/MediaMemory_MediaMemoryCore.bundle"
+/usr/bin/install -m 644 "$repository_directory/Packaging/AppIcon/AppIcon.icns" \
+    "$contents/Resources/AppIcon.icns"
 /usr/bin/plutil -convert binary1 -o "$contents/Info.plist" \
     "$repository_directory/Packaging/Info.plist"
 if [[ -n "${MEDIA_MEMORY_BUILD_NUMBER:-}" ]]; then
@@ -103,6 +109,13 @@ else
         "=designated => identifier \"$bundle_identifier\" and certificate leaf = H\"$identity_hash\""
     )
 fi
+# 嵌套的 MCP 服务器二进制必须先于外层 app 签名，--verify --deep 才能通过。
+/usr/bin/codesign \
+    --force \
+    --identifier "$bundle_identifier.mcp" \
+    --sign "$identity_hash" \
+    --timestamp=none \
+    "$contents/MacOS/media-memory-mcp"
 /usr/bin/codesign \
     --force \
     --identifier "$bundle_identifier" \
